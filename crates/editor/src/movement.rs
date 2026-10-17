@@ -4,15 +4,20 @@
 use super::{Bias, DisplayPoint, DisplaySnapshot, SelectionGoal, ToDisplayPoint};
 use crate::{
     DisplayRow, EditorStyle, ToOffset, ToPoint,
-    scroll::{ScrollOffset, SharedScrollAnchor},
+    display_map::SyntaxStyling,
+    scroll::{ScrollOffset, ScrollPixelOffset, SharedScrollAnchor},
+    selections_collection::HorizontalOrigins,
 };
 use gpui::{Pixels, WindowTextSystem};
-use language::{CharClassifier, Point};
+use language::{CharClassifier, Point, Selection};
 use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot};
 use serde::Deserialize;
 use workspace::searchable::Direction;
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+};
 
 /// Defines search strategy for items in `movement` module.
 /// `FindRange::SingeLine` only looks for a match on a single line at a time, whereas
@@ -25,13 +30,203 @@ pub enum FindRange {
 
 /// TextLayoutDetails encompasses everything we need to move vertically
 /// taking into account variable width characters.
+#[derive(Clone)]
 pub struct TextLayoutDetails {
     pub(crate) text_system: Arc<WindowTextSystem>,
     pub(crate) editor_style: EditorStyle,
     pub(crate) rem_size: Pixels,
+    pub(crate) syntax: SyntaxStyling,
+    pub(crate) horizontal_origins: HorizontalOrigins,
     pub scroll_anchor: SharedScrollAnchor,
     pub visible_rows: Option<f64>,
     pub vertical_scroll_margin: ScrollOffset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HorizontalSelectionEnd {
+    None,
+    Right,
+    SaturatingRight,
+}
+
+#[derive(Clone, Debug)]
+pub enum HorizontalMotion {
+    DisplayRows {
+        rows: u32,
+        bias: Bias,
+        preserve_column: bool,
+    },
+    DisplaySteps {
+        count: usize,
+        bias: Bias,
+    },
+    BufferRows {
+        rows: isize,
+        move_point: fn(
+            &DisplaySnapshot,
+            DisplayPoint,
+            SelectionGoal,
+            isize,
+            &TextLayoutDetails,
+        ) -> (DisplayPoint, SelectionGoal),
+    },
+    Viewport {
+        preserve_position: bool,
+        old_top: DisplayRow,
+        top: DisplayRow,
+        rows: i32,
+        min_row: DisplayRow,
+        max_row: DisplayRow,
+        force_row: Option<DisplayRow>,
+        visible_x: RangeInclusive<ScrollPixelOffset>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum HorizontalMotionSelection {
+    #[default]
+    Head,
+    InclusiveHead,
+    Start,
+    End,
+    Extend(HorizontalSelectionEnd),
+    ExtendIfNonempty,
+    Columnar,
+}
+
+impl HorizontalMotion {
+    pub fn apply(
+        &self,
+        snapshot: &DisplaySnapshot,
+        point: DisplayPoint,
+        goal: SelectionGoal,
+        details: &TextLayoutDetails,
+    ) -> (DisplayPoint, SelectionGoal) {
+        self.apply_with_pending(snapshot, point, goal, details).0
+    }
+
+    pub(crate) fn apply_with_pending(
+        &self,
+        snapshot: &DisplaySnapshot,
+        mut point: DisplayPoint,
+        mut goal: SelectionGoal,
+        details: &TextLayoutDetails,
+    ) -> ((DisplayPoint, SelectionGoal), bool) {
+        let mut unsettled = false;
+        let result = match self {
+            Self::DisplayRows {
+                rows,
+                bias: Bias::Left,
+                preserve_column,
+            } => up_by_rows(snapshot, point, *rows, goal, *preserve_column, details),
+            Self::DisplayRows {
+                rows,
+                bias: Bias::Right,
+                preserve_column,
+            } => down_by_rows(snapshot, point, *rows, goal, *preserve_column, details),
+            Self::DisplaySteps { count, bias } => {
+                details.record_horizontal_motion(self.clone());
+                let details = details.without_horizontal_motion_recording();
+                for _ in 0..*count {
+                    unsettled = unsettled
+                        || snapshot
+                            .long_row(point.row())
+                            .is_some_and(|row| !row.is_settled_through(point.column()));
+                    (point, goal) = if *bias == Bias::Left {
+                        up(snapshot, point, goal, true, &details)
+                    } else {
+                        down(snapshot, point, goal, true, &details)
+                    };
+                }
+                (point, goal)
+            }
+            Self::BufferRows { rows, move_point } => {
+                move_point(snapshot, point, goal, *rows, details)
+            }
+            Self::Viewport {
+                preserve_position,
+                old_top,
+                top,
+                rows,
+                min_row,
+                max_row,
+                force_row,
+                visible_x,
+            } => {
+                details.record_horizontal_motion(self.clone());
+                let starting_column = point.column();
+                if *preserve_position {
+                    let row = if old_top == top {
+                        point.row().0.saturating_add_signed(*rows)
+                    } else {
+                        top.0
+                            .saturating_add_signed(point.row().0 as i32 - old_top.0 as i32)
+                    };
+                    point = snapshot.clip_point(
+                        DisplayPoint::new(DisplayRow(row), point.column()),
+                        Bias::Left,
+                    );
+                }
+                let row = force_row.unwrap_or_else(|| {
+                    if point.row() < *min_row {
+                        *min_row
+                    } else if point.row() > *max_row {
+                        *max_row
+                    } else {
+                        point.row()
+                    }
+                });
+                let column = snapshot
+                    .visible_display_columns(row, visible_x.clone(), details)
+                    .map_or(starting_column, |columns| {
+                        starting_column.clamp(*columns.start(), *columns.end())
+                    });
+                (
+                    snapshot.clip_point(DisplayPoint::new(row, column), Bias::Left),
+                    goal,
+                )
+            }
+        };
+        (result, unsettled)
+    }
+}
+
+impl TextLayoutDetails {
+    pub fn record_horizontal_motion(&self, motion: HorizontalMotion) {
+        self.horizontal_origins.record_motion(motion, self);
+    }
+
+    pub fn without_horizontal_motion_recording(&self) -> Self {
+        Self {
+            horizontal_origins: self.horizontal_origins.without_motion_recording(),
+            ..self.clone()
+        }
+    }
+
+    pub fn record_horizontal_motion_selection(&self, selection: HorizontalMotionSelection) {
+        self.horizontal_origins.record_motion_selection(selection);
+    }
+
+    pub fn record_horizontal_bias(&self, bias: Bias) {
+        self.horizontal_origins.record_bias(bias);
+    }
+
+    pub fn record_horizontal_selection(
+        &self,
+        snapshot: &DisplaySnapshot,
+        selection: &Selection<DisplayPoint>,
+        end: HorizontalSelectionEnd,
+    ) {
+        self.horizontal_origins
+            .record_selection(snapshot, selection, end, self);
+    }
+
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            horizontal_origins: HorizontalOrigins::default(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Returns a column to the left of the current point, wrapping
@@ -124,6 +319,11 @@ pub(crate) fn up_by_rows(
     preserve_column_at_start: bool,
     text_layout_details: &TextLayoutDetails,
 ) -> (DisplayPoint, SelectionGoal) {
+    text_layout_details.record_horizontal_motion(HorizontalMotion::DisplayRows {
+        rows: row_count,
+        bias: Bias::Left,
+        preserve_column: preserve_column_at_start,
+    });
     let goal_x = match goal {
         SelectionGoal::HorizontalPosition(x) => x,
         SelectionGoal::WrappedHorizontalPosition((_, x)) => x,
@@ -144,6 +344,7 @@ pub(crate) fn up_by_rows(
         point = DisplayPoint::new(DisplayRow(0), 0);
     }
 
+    text_layout_details.record_horizontal_bias(Bias::Left);
     let mut clipped_point = map.clip_point(point, Bias::Left);
     if clipped_point.row() < point.row() {
         clipped_point = map.clip_point(point, Bias::Right);
@@ -159,6 +360,11 @@ pub(crate) fn down_by_rows(
     preserve_column_at_end: bool,
     text_layout_details: &TextLayoutDetails,
 ) -> (DisplayPoint, SelectionGoal) {
+    text_layout_details.record_horizontal_motion(HorizontalMotion::DisplayRows {
+        rows: row_count,
+        bias: Bias::Right,
+        preserve_column: preserve_column_at_end,
+    });
     let goal_x = match goal {
         SelectionGoal::HorizontalPosition(x) => x,
         SelectionGoal::WrappedHorizontalPosition((_, x)) => x,
@@ -176,6 +382,7 @@ pub(crate) fn down_by_rows(
         point = map.max_point();
     }
 
+    text_layout_details.record_horizontal_bias(Bias::Right);
     let mut clipped_point = map.clip_point(point, Bias::Right);
     if clipped_point.row() > point.row() {
         clipped_point = map.clip_point(point, Bias::Left);

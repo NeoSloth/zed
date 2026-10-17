@@ -1224,6 +1224,7 @@ impl Vim {
         }
 
         let last_mode = self.mode;
+        let clip_at_line_ends = self.clip_at_line_ends();
         let prior_mode = self.last_mode;
         let prior_tx = self.current_tx;
         self.last_mode = last_mode;
@@ -1362,7 +1363,10 @@ impl Vim {
                         }
                     }
                 });
-            })
+            });
+            if clip_at_line_ends != vim.clip_at_line_ends() {
+                editor.selections.freeze_horizontal_positions();
+            }
         });
     }
 
@@ -1918,17 +1922,21 @@ impl Vim {
                 });
             }
             HelixJumpBehaviour::Extend => {
-                let buffer = editor.buffer().read(cx).snapshot(cx);
-                let word_end = Vim::jump_target_word_end(&buffer, candidate.range.end);
+                let mut word_end = None;
                 editor.change_selections(Default::default(), window, cx, |s| {
                     s.move_with(&mut |map, selection| {
                         let word_start = candidate.range.start.to_display_point(map);
-                        let word_end = word_end.to_display_point(map);
                         let tail = selection.tail();
 
                         if word_start >= tail {
                             // Jumping forward: extend head to end of target word
-                            selection.set_head(word_end, SelectionGoal::None);
+                            let word_end = *word_end.get_or_insert_with(|| {
+                                Vim::jump_target_word_end(
+                                    map.buffer_snapshot(),
+                                    candidate.range.end,
+                                )
+                            });
+                            selection.set_head(word_end.to_display_point(map), SelectionGoal::None);
                         } else {
                             // Jumping backward: extend backward while keeping current extent
                             // Use current end as tail to preserve the selection
@@ -2313,6 +2321,9 @@ impl Vim {
         cx: &mut Context<Editor>,
     ) {
         editor.set_cursor_shape(state.cursor_shape, cx);
+        if editor.clip_at_line_ends(cx) != state.clip_at_line_ends {
+            editor.selections.freeze_horizontal_positions();
+        }
         editor.set_clip_at_line_ends(state.clip_at_line_ends, cx);
         editor.set_collapse_matches(state.collapse_matches);
         editor.set_input_enabled(state.input_enabled);

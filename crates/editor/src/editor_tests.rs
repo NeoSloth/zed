@@ -9,7 +9,7 @@ use crate::{
     runnables::RunnableTasks,
     scroll::scroll_amount::ScrollAmount,
     test::{
-        assert_text_with_selections, build_editor, editor_content_with_blocks,
+        ShapingTextSystem, assert_text_with_selections, build_editor, editor_content_with_blocks,
         editor_lsp_test_context::{EditorLspTestContext, git_commit_lang},
         editor_test_context::EditorTestContext,
         select_ranges,
@@ -63,6 +63,7 @@ use settings::{
 use std::{
     borrow::Cow,
     cmp::Ordering,
+    ops::RangeInclusive,
     sync::{Arc, atomic},
 };
 use std::{cell::RefCell, future::Future, rc::Rc, sync::atomic::AtomicBool, time::Instant};
@@ -1318,6 +1319,37 @@ async fn test_navigation_history(cx: &mut TestAppContext) {
                 original_scroll_position
             );
 
+            let snapshot = editor.display_snapshot(cx);
+            let horizontal_anchor = snapshot.buffer_snapshot().anchor_before(Point::new(5, 2));
+            editor.scroll_manager.store_horizontal_anchor(
+                Some((horizontal_anchor, 3.5)),
+                &snapshot,
+                cx,
+            );
+            let serialized = editor.scroll_manager.serialized_position(&snapshot, cx);
+            editor.deactivated(window, cx);
+            let navigation = pop_history(&mut editor, cx).expect("navigation entry");
+            editor.buffer.update(cx, |buffer, cx| {
+                buffer.edit([(Point::new(5, 0)..Point::new(5, 0), "\té")], None, cx);
+            });
+            editor.move_to_end(&MoveToEnd, window, cx);
+            editor.restore_scroll_position(serialized, window, cx);
+            assert_eq!(
+                editor
+                    .scroll_manager
+                    .serialized_position(&editor.display_snapshot(cx), cx)
+                    .horizontal,
+                Some((Point::new(5, 1), 3.5))
+            );
+            assert!(editor.navigate(navigation.data.expect("navigation data"), window, cx));
+            assert_eq!(
+                editor
+                    .scroll_manager
+                    .serialized_position(&editor.display_snapshot(cx), cx)
+                    .horizontal,
+                Some((Point::new(5, 5), 3.5))
+            );
+
             let other_buffer =
                 cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local("test", cx)), cx));
 
@@ -1335,6 +1367,7 @@ async fn test_navigation_history(cx: &mut TestAppContext) {
                         offset: Default::default(),
                     },
                     scroll_top_row: invalid_point.row,
+                    horizontal_scroll: Some((invalid_anchor, invalid_point, 0.)),
                 }),
                 window,
                 cx,
@@ -3590,6 +3623,26 @@ async fn test_newest_selection_on_screen_with_multibyte_chars(cx: &mut TestAppCo
         assert_eq!(
             editor.newest_selection_on_screen(window, cx),
             Ordering::Greater
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_newest_selection_left_of_screen_below_top_row(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state(&format!("\n{}ˇ{}\n", "a".repeat(30), "a".repeat(70)));
+    cx.update_editor(|editor, window, cx| {
+        editor.set_visible_line_count(50., window, cx);
+        editor.set_visible_column_count(20.);
+        let mut on_screen_at = |scroll_x: f64| {
+            editor.set_scroll_position(gpui::Point::new(scroll_x, 0.), window, cx);
+            editor.newest_selection_on_screen(window, cx)
+        };
+        assert_eq!(
+            [on_screen_at(0.), on_screen_at(20.), on_screen_at(40.)],
+            [Ordering::Greater, Ordering::Equal, Ordering::Less]
         );
     });
 }
@@ -7325,6 +7378,91 @@ fn test_delete_line(cx: &mut TestAppContext) {
             vec![DisplayPoint::new(DisplayRow(0), 0)..DisplayPoint::new(DisplayRow(0), 0)]
         );
     });
+}
+
+#[test]
+fn test_delete_line_resolves_long_rows_before_editing() {
+    for settled_first in [false, true] {
+        for delete_last_row in [false, true] {
+            let mut cx = TestAppContext::build_with_text_system(
+                gpui::TestDispatcher::new(0),
+                None,
+                Arc::new(ShapingTextSystem(gpui::NoopTextSystem)),
+            );
+            init_test(&mut cx, |_| {});
+            cx.background_executor.set_block_on_ticks(0..=0);
+            let source = format!(
+                "{}{}{}",
+                "x".repeat(1_000),
+                "w".repeat(8),
+                "x".repeat(33_000)
+            );
+            let destination = "x".repeat(34_010);
+            let unrelated = "w".repeat(2_000);
+            let text = if delete_last_row {
+                format!("{unrelated}\n{destination}\n{source}")
+            } else {
+                format!("{unrelated}\n{source}\n{destination}")
+            };
+            let editor = cx.add_window(|window, cx| {
+                let buffer = MultiBuffer::build_simple(&text, cx);
+                let mut editor = build_editor(buffer, window, cx);
+                editor.set_soft_wrap_mode(language_settings::SoftWrap::None, cx);
+                let style = editor.style(cx).clone();
+                editor.set_style(style, window, cx);
+                editor
+            });
+            if settled_first {
+                cx.run_until_parked();
+            }
+            editor
+                .update(&mut cx, |editor, window, cx| {
+                    let point = Point::new(if delete_last_row { 2 } else { 1 }, 34_006);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([point..point]);
+                        },
+                    );
+                    editor.delete_line(&DeleteLine, window, cx);
+                    let snapshot = editor.display_snapshot(cx);
+                    let selection = editor.selections.newest::<Point>(&snapshot);
+                    assert_eq!(
+                        selection.range(),
+                        Point::new(1, 34_004)..Point::new(1, 34_004)
+                    );
+                    assert_eq!(selection.goal, SelectionGoal::None);
+                    assert_eq!(editor.text(cx), format!("{unrelated}\n{destination}"));
+                    if !settled_first {
+                        assert!(
+                            !snapshot
+                                .long_row(DisplayRow(0))
+                                .expect("unrelated row")
+                                .is_measured()
+                        );
+                    }
+                })
+                .expect("editor window");
+            cx.run_until_parked();
+            editor
+                .update(&mut cx, |editor, _, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    assert_eq!(
+                        editor.selections.newest::<Point>(&snapshot).head(),
+                        Point::new(1, 34_004)
+                    );
+                    assert!(
+                        snapshot
+                            .long_row(DisplayRow(0))
+                            .expect("unrelated row")
+                            .is_measured()
+                    );
+                })
+                .expect("editor window");
+        }
+    }
 }
 
 #[gpui::test]
@@ -14092,13 +14230,20 @@ async fn test_visible_display_columns_stay_inside_fractional_viewport(cx: &mut T
             let snapshot = editor.display_snapshot(cx);
             let row = DisplayRow(0);
             let column_width = snapshot.x_for_display_point(DisplayPoint::new(row, 1), &details);
-            assert_eq!(
+            let visible_columns = |columns: RangeInclusive<f64>| {
                 snapshot.visible_display_columns(
                     row,
-                    20.25 * column_width..=59.75 * column_width,
-                    &details
-                ),
-                20..=59,
+                    columns.start() * column_width..=columns.end() * column_width,
+                    &details,
+                )
+            };
+            assert_eq!(
+                [
+                    visible_columns(20.25..=59.75),
+                    visible_columns(0.6..=0.9),
+                    visible_columns(len as f64 + 0.5..=len as f64 + 40.),
+                ],
+                [Some(20..=59), Some(0..=0), None],
                 "row of {len} characters"
             );
         });

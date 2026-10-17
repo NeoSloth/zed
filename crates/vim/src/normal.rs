@@ -29,7 +29,7 @@ use editor::{Anchor, SelectionEffects};
 use editor::{Bias, ToPoint};
 use editor::{display_map::ToDisplayPoint, movement};
 use gpui::{Context, TaskExt, Window, actions};
-use language::{AutoIndentMode, Point, SelectionGoal};
+use language::{AutoIndentMode, Point, Selection, SelectionGoal};
 use log::error;
 use multi_buffer::MultiBufferRow;
 
@@ -623,11 +623,23 @@ impl Vim {
                 window,
                 cx,
                 |s| {
-                    s.move_cursors_with(&mut |map, cursor, goal| {
-                        motion
-                            .move_point(map, cursor, goal, times, &text_layout_details)
-                            .unwrap_or((cursor, goal))
-                    })
+                    let mut move_selection = |map: &_, selection: &mut Selection<_>| {
+                        let (cursor, goal) = motion
+                            .move_point(
+                                map,
+                                selection.head(),
+                                selection.goal,
+                                times,
+                                &text_layout_details,
+                            )
+                            .unwrap_or((selection.head(), selection.goal));
+                        selection.collapse_to(cursor, goal);
+                    };
+                    if matches!(motion, Motion::Up { .. } | Motion::Down { .. }) {
+                        s.move_with_horizontal_goals(&mut move_selection);
+                    } else {
+                        s.move_with(&mut move_selection);
+                    }
                 },
             );
 
@@ -1181,11 +1193,12 @@ mod test {
     use settings::SettingsStore;
 
     use crate::{
-        motion,
+        VimAddon, motion,
         state::Mode::{self},
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use language;
+    use editor::SelectionEffects;
+    use language::{self, Point, language_settings::SoftWrap};
 
     #[gpui::test]
     async fn test_h(cx: &mut gpui::TestAppContext) {
@@ -1239,6 +1252,137 @@ mod test {
         )
         .await
         .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_repeated_vertical_motion_preserves_merged_intents(cx: &mut TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(SoftWrap::None, cx));
+        let line = "x".repeat(133_005);
+        let source = format!("{}😀{}", "x".repeat(100_000), "x".repeat(33_001));
+
+        for display_lines in [false, true] {
+            for (mode, reversed, interrupt, settle_first) in [
+                (Mode::Normal, false, false, true),
+                (Mode::Normal, false, false, false),
+                (Mode::Normal, false, true, false),
+                (Mode::Visual, false, false, false),
+                (Mode::Visual, true, false, false),
+                (Mode::HelixSelect, false, false, false),
+                (Mode::HelixSelect, true, false, false),
+            ] {
+                let (text, source_row, motion) = if reversed {
+                    (
+                        format!("ˇ{line}\nxx\n"),
+                        2,
+                        motion::Motion::Up { display_lines },
+                    )
+                } else {
+                    (
+                        format!("ˇ\nxx\n{line}"),
+                        0,
+                        motion::Motion::Down { display_lines },
+                    )
+                };
+                cx.set_state(&text, mode);
+                cx.background_executor.set_block_on_ticks(0..=0);
+                let (vim, oldest_id) = cx.update_editor(|editor, window, cx| {
+                    editor.buffer().update(cx, |buffer, cx| {
+                        let start = Point::new(source_row, 0);
+                        buffer.edit([(start..start, source.as_str())], None, cx);
+                    });
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            let columns = if mode == Mode::Normal {
+                                &[133_003, 133_004][..]
+                            } else {
+                                &[133_003][..]
+                            };
+                            selections.select_ranges(columns.iter().map(|&column| {
+                                let point = Point::new(source_row, column);
+                                let end = Point::new(source_row, column + 1);
+                                if mode == Mode::Normal {
+                                    point..point
+                                } else if reversed {
+                                    end..point
+                                } else {
+                                    point..end
+                                }
+                            }));
+                        },
+                    );
+                    (
+                        editor.addon::<VimAddon>().cloned().unwrap(),
+                        editor.selections.oldest_anchor().id,
+                    )
+                });
+                if settle_first {
+                    cx.background_executor.set_block_on_ticks(0..=50);
+                    cx.run_until_parked();
+                    cx.background_executor.set_block_on_ticks(0..=0);
+                    cx.update_editor(|editor, _, cx| {
+                        assert!(
+                            editor
+                                .display_snapshot(cx)
+                                .long_row(editor::display_map::DisplayRow(source_row))
+                                .expect("source row")
+                                .is_measured()
+                        );
+                    });
+                }
+                cx.update(|window, cx| {
+                    vim.entity.update(cx, |vim, cx| {
+                        vim.motion(motion.clone(), window, cx);
+                        vim.update_editor(cx, |_, editor, cx| {
+                            assert_eq!(editor.selections.count(), 1);
+                            let snapshot = editor.display_snapshot(cx);
+                            let selection = editor.selections.newest::<Point>(&snapshot);
+                            let head = if mode == Mode::Normal {
+                                Point::new(1, 1)
+                            } else if reversed {
+                                Point::new(1, 2)
+                            } else {
+                                Point::new(2, 0)
+                            };
+                            assert_eq!((selection.head(), selection.reversed), (head, reversed));
+                            assert_eq!(selection.id, oldest_id);
+                        });
+                        if interrupt {
+                            vim.motion(motion::Motion::Left, window, cx);
+                        }
+                        vim.motion(motion, window, cx);
+                    });
+                });
+                cx.background_executor.set_block_on_ticks(0..=50);
+                cx.run_until_parked();
+                cx.update_editor(|editor, _, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let expected = if interrupt {
+                        vec![(Point::new(2, 0)..Point::new(2, 0), false)]
+                    } else if mode == Mode::Normal {
+                        vec![(Point::new(2, 133_001)..Point::new(2, 133_001), false)]
+                    } else if reversed {
+                        vec![(Point::new(0, 133_001)..Point::new(2, 133_004), true)]
+                    } else {
+                        vec![(Point::new(0, 133_003)..Point::new(2, 133_002), false)]
+                    };
+                    assert_eq!(
+                        editor
+                            .selections
+                            .all::<Point>(&snapshot)
+                            .into_iter()
+                            .map(|selection| (selection.range(), selection.reversed))
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "mode={mode:?}, reversed={reversed}, display_lines={display_lines}, interrupt={interrupt}, settle_first={settle_first}"
+                    );
+                    assert_eq!(editor.selections.oldest_anchor().id, oldest_id);
+                });
+            }
+        }
     }
 
     #[gpui::test]

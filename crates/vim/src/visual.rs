@@ -4,7 +4,7 @@ use collections::HashMap;
 use editor::{
     Bias, DisplayPoint, Editor, MultiBufferOffset, SelectionEffects,
     display_map::{DisplaySnapshot, ToDisplayPoint},
-    movement,
+    movement::{self, HorizontalSelectionEnd},
 };
 use gpui::{Context, Window, actions};
 use language::{Point, Selection, SelectionGoal};
@@ -220,6 +220,7 @@ impl Vim {
     ) {
         self.update_editor(cx, |vim, editor, cx| {
             let text_layout_details = editor.text_layout_details(window, cx);
+            let is_up_or_down = matches!(motion, Motion::Up { .. } | Motion::Down { .. });
             if vim.mode == Mode::VisualBlock
                 && !matches!(
                     motion,
@@ -228,7 +229,6 @@ impl Vim {
                     }
                 )
             {
-                let is_up_or_down = matches!(motion, Motion::Up { .. } | Motion::Down { .. });
                 vim.visual_block_motion(
                     is_up_or_down,
                     editor,
@@ -240,7 +240,7 @@ impl Vim {
                 )
             } else {
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(&mut |map, selection| {
+                    let mut move_selection = |map: &_, selection: &mut Selection<_>| {
                         let was_reversed = selection.reversed;
                         let mut current_head = selection.head();
 
@@ -262,6 +262,13 @@ impl Vim {
                         };
 
                         selection.set_head(new_head, goal);
+                        if is_up_or_down {
+                            text_layout_details.record_horizontal_selection(
+                                map,
+                                selection,
+                                HorizontalSelectionEnd::Right,
+                            );
+                        }
 
                         // ensure the current character is included in the selection.
                         if !selection.reversed {
@@ -282,7 +289,12 @@ impl Vim {
                         } else if !was_reversed && selection.reversed {
                             selection.end = movement::right(map, selection.end);
                         }
-                    })
+                    };
+                    if is_up_or_down {
+                        s.move_with_horizontal_goals(&mut move_selection);
+                    } else {
+                        s.move_with(&mut move_selection);
+                    }
                 });
             }
         });
@@ -334,7 +346,12 @@ impl Vim {
                 return;
             };
             head = new_head;
-            head_x = map.x_for_display_point(head, &text_layout_details);
+            head_x = if preserve_goal {
+                map.layout_row(head.row(), &text_layout_details)
+                    .x_for_index(head.column() as usize)
+            } else {
+                map.x_for_display_point(head, &text_layout_details)
+            };
 
             let is_reversed = tail_x > head_x;
             if was_reversed && !is_reversed {
@@ -362,6 +379,10 @@ impl Vim {
                 };
             }
 
+            let pending_positions = [head, tail].into_iter().any(|point| {
+                map.long_row(point.row())
+                    .is_some_and(|row| !row.is_settled_through(point.column()))
+            });
             let mut selections = Vec::new();
             let mut row = tail.row();
             let going_up = tail.row() > head.row();
@@ -375,17 +396,31 @@ impl Vim {
                 );
                 let mut end =
                     DisplayPoint::new(row, laid_out_line.closest_index_for_x(positions.end) as u32);
-                if end <= start {
-                    if start.column() == map.line_len(start.row()) {
-                        end = start;
-                    } else {
-                        end = movement::saturating_right(map, start);
+                if positions.start <= laid_out_line.width()
+                    || pending_positions
+                    || map.long_row(row).is_some_and(|row| !row.is_measured())
+                {
+                    let id = s.new_selection_id();
+                    text_layout_details.record_horizontal_selection(
+                        map,
+                        &Selection {
+                            id,
+                            start,
+                            end,
+                            reversed: is_reversed,
+                            goal,
+                        },
+                        HorizontalSelectionEnd::SaturatingRight,
+                    );
+                    if end <= start {
+                        if start.column() == map.line_len(start.row()) {
+                            end = start;
+                        } else {
+                            end = movement::saturating_right(map, start);
+                        }
                     }
-                }
-
-                if positions.start <= laid_out_line.width() {
                     let selection = Selection {
-                        id: s.new_selection_id(),
+                        id,
                         start: start.to_point(map),
                         end: end.to_point(map),
                         reversed: is_reversed &&
@@ -937,10 +972,16 @@ impl Vim {
 }
 #[cfg(test)]
 mod test {
+    use editor::{SelectionEffects, display_map::DisplayRow};
+    use gpui::UpdateGlobal;
     use indoc::indoc;
+    use language::Point;
+    use settings::{FontSize, SettingsStore};
     use workspace::item::Item;
 
     use crate::{
+        VimAddon,
+        motion::Motion,
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
@@ -1295,6 +1336,159 @@ mod test {
                     ˇfox jumps over
                     the lazy dog"});
         cx.shared_clipboard().await.assert_eq("fox jumps over\n");
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_pending_row_membership(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.buffer_font_size = Some(FontSize(15.));
+                });
+            });
+        });
+        cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(settings::SoftWrap::None, cx));
+        cx.set_state("aa«aˇ»\nx\nxxxx", Mode::VisualBlock);
+        cx.simulate_keystrokes("j");
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(
+                editor
+                    .selections
+                    .all::<Point>(&snapshot)
+                    .iter()
+                    .map(|selection| selection.range())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Point::new(0, 1)..Point::new(0, 3),
+                    Point::new(1, 1)..Point::new(1, 1)
+                ]
+            );
+        });
+        let line = "x".repeat(200_050);
+
+        for restore in [false, true] {
+            for interrupt in [false, true] {
+                let (text, cold_row, source_column, suffix) = if restore {
+                    (format!("ˇ{line}\n\n{line}"), 1, 200_004, 99_992)
+                } else {
+                    (
+                        format!("ˇ\n{}\n{line}", "x".repeat(200_010)),
+                        0,
+                        200_030,
+                        100_000,
+                    )
+                };
+                let cold = format!(
+                    "{}{}{}",
+                    "x".repeat(100_000),
+                    "😀".repeat(8),
+                    "x".repeat(suffix)
+                );
+                cx.set_state(&text, Mode::VisualBlock);
+                cx.background_executor.set_block_on_ticks(0..=0);
+                let vim = cx.update_editor(|editor, window, cx| {
+                    editor.buffer().update(cx, |buffer, cx| {
+                        let start = Point::new(cold_row, 0);
+                        buffer.edit([(start..start, cold.as_str())], None, cx);
+                    });
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([
+                                Point::new(0, source_column)..Point::new(0, source_column + 1)
+                            ]);
+                        },
+                    );
+                    editor.addon::<VimAddon>().cloned().expect("vim")
+                });
+                cx.update(|window, cx| {
+                    vim.entity.update(cx, |vim, cx| {
+                        vim.visual_motion(
+                            Motion::Down {
+                                display_lines: false,
+                            },
+                            Some(2),
+                            window,
+                            cx,
+                        );
+                        if interrupt {
+                            vim.switch_mode(Mode::Insert, false, window, cx);
+                        }
+                    });
+                });
+                let initial_rows = if restore { vec![0, 2] } else { vec![0, 1, 2] };
+                cx.update_editor(|editor, _, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    assert!(
+                        !snapshot
+                            .long_row(DisplayRow(cold_row))
+                            .expect("cold row")
+                            .is_measured()
+                    );
+                    assert_eq!(
+                        editor
+                            .selections
+                            .all::<Point>(&snapshot)
+                            .iter()
+                            .map(|selection| selection.start.row)
+                            .collect::<Vec<_>>(),
+                        initial_rows,
+                        "initial rows: restore={restore}, interrupt={interrupt}, selections={:?}",
+                        editor.selections.all::<Point>(&snapshot)
+                    );
+                });
+                cx.background_executor.set_block_on_ticks(0..=50);
+                cx.run_until_parked();
+                cx.update_editor(|editor, _, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    assert!(
+                        snapshot
+                            .long_row(DisplayRow(cold_row))
+                            .expect("cold row")
+                            .is_measured()
+                    );
+                    let selections = editor.selections.all::<Point>(&snapshot);
+                    let rows = if interrupt {
+                        initial_rows
+                    } else if restore {
+                        vec![0, 1, 2]
+                    } else {
+                        vec![0, 2]
+                    };
+                    assert_eq!(
+                        selections
+                            .iter()
+                            .map(|selection| selection.start.row)
+                            .collect::<Vec<_>>(),
+                        rows,
+                        "restore={restore}, interrupt={interrupt}"
+                    );
+                    if !interrupt {
+                        let columns = if restore {
+                            vec![(0, 200_004), (1, 200_020), (2, 200_004)]
+                        } else {
+                            vec![(0, 200_030), (2, 200_014)]
+                        };
+                        assert_eq!(
+                            selections
+                                .iter()
+                                .map(|selection| selection.range())
+                                .collect::<Vec<_>>(),
+                            columns
+                                .into_iter()
+                                .map(|(row, column)| Point::new(row, column)
+                                    ..Point::new(row, column + 1))
+                                .collect::<Vec<_>>(),
+                            "settled ranges: restore={restore}, interrupt={interrupt}"
+                        );
+                    }
+                });
+            }
+        }
     }
 
     #[gpui::test]

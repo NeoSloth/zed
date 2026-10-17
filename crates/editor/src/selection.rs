@@ -57,6 +57,31 @@ impl Editor {
         self.change_selections_with_history(effects, None, window, cx, change)
     }
 
+    pub(crate) fn settle_horizontal_goals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selections.has_provisional_horizontal_goals() {
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        if !self.selections.has_unsettled_horizontal_goals(&snapshot) {
+            return;
+        }
+        let details = self.text_layout_details(window, cx);
+        self.selections.set_horizontal_layout_details(&details);
+        let history_mode = mem::replace(
+            &mut self.selection_history.mode,
+            SelectionHistoryMode::Skipping,
+        );
+        self.change_selections(
+            SelectionEffects::scroll(Autoscroll::newest())
+                .nav_history(false)
+                .completions(false),
+            window,
+            cx,
+            |_| {},
+        );
+        self.selection_history.mode = history_mode;
+    }
+
     /// Re-resolves selection anchors so they reference live buffer fragments.
     ///
     /// Deleted CRDT fragments remain as tombstones. An anchor associated with a
@@ -1082,12 +1107,7 @@ impl Editor {
                     SelectionEffects::scroll(Autoscroll::newest()),
                     window,
                     cx,
-                    |s| {
-                        s.select_anchors_unexpanded(
-                            entry.selections.to_vec(),
-                            entry.goal_origins.clone(),
-                        )
-                    },
+                    |s| s.select_anchors_unexpanded(entry.selections.to_vec()),
                 );
             });
             self.selection_history.mode = SelectionHistoryMode::Normal;
@@ -1112,12 +1132,7 @@ impl Editor {
                     SelectionEffects::scroll(Autoscroll::newest()),
                     window,
                     cx,
-                    |s| {
-                        s.select_anchors_unexpanded(
-                            entry.selections.to_vec(),
-                            entry.goal_origins.clone(),
-                        )
-                    },
+                    |s| s.select_anchors_unexpanded(entry.selections.to_vec()),
                 );
             });
             self.selection_history.mode = SelectionHistoryMode::Normal;
@@ -2015,37 +2030,24 @@ impl Editor {
             .collect::<HashMap<_, _>>();
         let mut unchanged = HashSet::default();
         let mut removed = HashSet::default();
+        let overlaps = SelectionOverlapIndex::new(current);
         for selection in previous {
             if let Some(current) = current_by_id.get(&selection.id) {
                 if **current == *selection {
                     unchanged.insert(selection.id);
                 }
-            } else {
-                let index = current.partition_point(|current| current.end < selection.start);
-                let overlaps = current
-                    .iter()
-                    .skip(index)
-                    .take_while(|current| current.start <= selection.end)
-                    .any(|current| {
-                        if current.is_empty() || selection.is_empty() {
-                            current.start <= selection.end && selection.start <= current.end
-                        } else {
-                            current.start < selection.end && selection.start < current.end
-                        }
-                    });
-                if !overlaps {
-                    removed.insert(selection.id);
-                }
+            } else if !overlaps.overlaps(selection.range()) {
+                removed.insert(selection.id);
             }
         }
         Self::retain_add_selection_goals(state, &unchanged, &removed, &current_by_id);
     }
 
-    fn resolve_add_selection_anchors(
-        selections: &[Selection<Anchor>],
-        snapshot: &DisplaySnapshot,
-    ) -> Vec<Selection<Point>> {
-        selections
+    fn resolve_add_selection_anchors(&self, snapshot: &DisplaySnapshot) -> Vec<Selection<Point>> {
+        let intents = self.selections.columnar_goal_selections(snapshot);
+        intents
+            .as_deref()
+            .unwrap_or(self.selections.disjoint_anchors())
             .iter()
             .filter(|selection| {
                 snapshot.can_resolve(&selection.start) && snapshot.can_resolve(&selection.end)
@@ -2062,15 +2064,15 @@ impl Editor {
         let previous = self
             .add_selections_state
             .as_ref()
-            .map(|_| self.selections.disjoint_anchors_arc());
+            .map(|_| self.resolve_add_selection_anchors(snapshot));
         let (changed, result) = self.selections.change_with(snapshot, change);
+        let current =
+            (changed && previous.is_some()).then(|| self.resolve_add_selection_anchors(snapshot));
         if changed
             && let Some(previous) = previous
+            && let Some(current) = current
             && let Some(state) = &mut self.add_selections_state
         {
-            let previous = Self::resolve_add_selection_anchors(&previous, snapshot);
-            let current =
-                Self::resolve_add_selection_anchors(self.selections.disjoint_anchors(), snapshot);
             Self::reconcile_add_selection_groups(state, &previous, &current);
             if state.groups.is_empty() {
                 self.add_selections_state = None;
@@ -2082,7 +2084,6 @@ impl Editor {
     fn selection_history_entry(&self) -> SelectionHistoryEntry {
         SelectionHistoryEntry {
             selections: self.selections.disjoint_anchors_arc(),
-            goal_origins: self.selections.goal_origins(),
             select_next_state: self.select_next_state.clone(),
             select_prev_state: self.select_prev_state.clone(),
             add_selections_state: self.add_selections_state.clone(),
@@ -2122,10 +2123,35 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.settle_horizontal_goals(window, cx);
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let text_layout_details = self.text_layout_details(window, cx);
         let buffer = display_map.buffer_snapshot();
-        let all_selections = self.selections.all_unexpanded::<Point>(&display_map);
+        let all_selections = self
+            .selections
+            .columnar_goal_selections(&display_map)
+            .map(|intents| {
+                intents
+                    .into_iter()
+                    .map(|selection| selection.map(|anchor| anchor.to_point(buffer)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| self.selections.all_unexpanded::<Point>(&display_map));
+        let boundary = if above {
+            DisplayRow(0)
+        } else {
+            display_map.max_point().row()
+        };
+        if self.add_selections_state.is_none()
+            && all_selections.iter().all(|selection| {
+                let range = selection.display_range(&display_map);
+                range.start.row() == boundary
+                    && range.end.row() == boundary
+                    && !display_map.is_block_line(boundary)
+            })
+        {
+            return;
+        }
         let goal_source_for_selection = |selection: &Selection<Point>| {
             let end_bias = if selection.is_empty() {
                 Bias::Right
@@ -2154,10 +2180,7 @@ impl Editor {
                 skip_soft_wrap,
             });
         if !state.groups.is_empty() {
-            let previous = Self::resolve_add_selection_anchors(
-                self.selections.disjoint_anchors(),
-                &display_map,
-            );
+            let previous = self.resolve_add_selection_anchors(&display_map);
             Self::reconcile_add_selection_groups(&mut state, &previous, &all_selections);
         }
         let columnar_selection_ids = state
@@ -2167,10 +2190,9 @@ impl Editor {
             .copied()
             .collect::<HashSet<_>>();
         let mut columnar_rows = ColumnarSelectionRows::new(&display_map);
-        let (mut columnar_selections, new_selections_to_columnarize) =
-            all_selections
-                .into_iter()
-                .partition::<Vec<_>, _>(|selection| columnar_selection_ids.contains(&selection.id));
+        let (mut columnar_selections, mut new_selections_to_columnarize) = all_selections
+            .into_iter()
+            .partition::<Vec<_>, _>(|selection| columnar_selection_ids.contains(&selection.id));
 
         let mut goal_columns_by_selection_id = HashMap::default();
         let mut projected_selections = Vec::new();
@@ -2249,7 +2271,27 @@ impl Editor {
                 .selections
                 .build_columnar_selections_from_tab_expanded_columns(&mut columnar_rows, &queries);
         }
+        let original_selections = if skip_soft_wrap {
+            HashMap::default()
+        } else {
+            new_selections_to_columnarize
+                .iter()
+                .map(|selection| (selection.id, *selection))
+                .collect::<HashMap<_, _>>()
+        };
+        let columnar_positions = if skip_soft_wrap {
+            HashMap::default()
+        } else {
+            self.selections.columnar_positions(
+                &mut new_selections_to_columnarize,
+                &display_map,
+                &text_layout_details,
+            )
+        };
         let mut projected_selections = projected_selections.into_iter();
+        let horizontal_origins = (!skip_soft_wrap && display_map.may_have_long_rows())
+            .then_some(&text_layout_details.horizontal_origins);
+        let mut horizontal_goal_copies = Vec::new();
         for (selection, projection_count) in new_selections_to_columnarize
             .into_iter()
             .zip(projection_counts)
@@ -2285,10 +2327,11 @@ impl Editor {
                 }
                 continue;
             }
+            if let Some(origins) = horizontal_origins {
+                origins.set_selection(Some(selection.id));
+            }
             let range = selection.display_range(&display_map).sorted();
-            let start_x = display_map.x_for_display_point(range.start, &text_layout_details);
-            let end_x = display_map.x_for_display_point(range.end, &text_layout_details);
-            let positions = start_x.min(end_x)..start_x.max(end_x);
+            let positions = &columnar_positions[&selection.id];
             let mut stack = Vec::new();
             if range.start.row() == range.end.row() && !display_map.is_block_line(range.start.row())
             {
@@ -2302,15 +2345,16 @@ impl Editor {
                 });
             } else {
                 for row in range.start.row().0..=range.end.row().0 {
-                    if let Some(selection) = self.selections.build_columnar_selection(
+                    if let Some(columnar_selection) = self.selections.build_columnar_selection(
                         &display_map,
                         DisplayRow(row),
-                        &positions,
+                        positions,
                         selection.reversed,
                         &text_layout_details,
                     ) {
-                        stack.push(selection.id);
-                        columnar_selections.push(selection);
+                        horizontal_goal_copies.push((selection.id, columnar_selection.id));
+                        stack.push(columnar_selection.id);
+                        columnar_selections.push(columnar_selection);
                     }
                 }
             }
@@ -2324,16 +2368,23 @@ impl Editor {
                     goal_source: None,
                 });
             } else {
-                columnar_selections.push(selection);
+                self.selections.discard_columnar_positions(selection.id);
+                columnar_selections.push(
+                    original_selections
+                        .get(&selection.id)
+                        .copied()
+                        .unwrap_or(selection),
+                );
             }
         }
+        if let Some(origins) = horizontal_origins {
+            origins.set_selection(None);
+        }
 
+        self.selections
+            .copy_horizontal_goals(&horizontal_goal_copies);
+        horizontal_goal_copies.clear();
         let mut final_selections = Vec::new();
-        let end_row = if above {
-            DisplayRow(0)
-        } else {
-            display_map.max_point().row()
-        };
 
         if skip_soft_wrap {
             for selection in &mut columnar_selections {
@@ -2376,6 +2427,9 @@ impl Editor {
         }
 
         for selection in columnar_selections {
+            if let Some(origins) = horizontal_origins {
+                origins.set_selection(Some(selection.id));
+            }
             if let Some(group) = last_added_item_per_group.get_mut(&selection.id) {
                 if skip_soft_wrap && group.stack.len() == 1 {
                     group.above = above;
@@ -2385,11 +2439,6 @@ impl Editor {
                         next_logical_selections.remove(&selection.id).flatten()
                     } else {
                         let range = selection.display_range(&display_map).sorted();
-                        let row = if above {
-                            range.start.row()
-                        } else {
-                            range.end.row()
-                        };
                         let positions =
                             if let SelectionGoal::HorizontalRange { start, end } = selection.goal {
                                 start..end
@@ -2402,8 +2451,7 @@ impl Editor {
                             };
                         self.selections.find_next_columnar_selection_by_display_row(
                             &display_map,
-                            row,
-                            end_row,
+                            &selection,
                             above,
                             &positions,
                             selection.reversed,
@@ -2412,6 +2460,9 @@ impl Editor {
                     };
 
                     if let Some(new_selection) = maybe_new_selection {
+                        if !skip_soft_wrap {
+                            horizontal_goal_copies.push((selection.id, new_selection.id));
+                        }
                         group.stack.push(new_selection.id);
                         if above {
                             final_selections.push(new_selection);
@@ -2420,6 +2471,9 @@ impl Editor {
                             final_selections.push(selection);
                             final_selections.push(new_selection);
                         }
+                    } else if let Some(original) = original_selections.get(&selection.id) {
+                        self.selections.discard_columnar_positions(selection.id);
+                        final_selections.push(*original);
                     } else {
                         final_selections.push(selection);
                     }
@@ -2430,6 +2484,9 @@ impl Editor {
                 final_selections.push(selection);
             }
         }
+        if let Some(origins) = horizontal_origins {
+            origins.set_selection(None);
+        }
 
         let unmerged_selections = final_selections.clone();
         self.change_selections_with_history(
@@ -2437,10 +2494,13 @@ impl Editor {
             history_entry,
             window,
             cx,
-            |selections| selections.select(final_selections),
+            |selections| {
+                selections.copy_horizontal_goals(&horizontal_goal_copies);
+                selections.select(final_selections);
+            },
         );
 
-        let current = self.selections.all_unexpanded::<Point>(&display_map);
+        let current = self.resolve_add_selection_anchors(&display_map);
         Self::reconcile_add_selection_groups(&mut state, &unmerged_selections, &current);
 
         if !state.groups.is_empty() {
@@ -2801,5 +2861,119 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.select(new_selections);
         });
+    }
+}
+
+struct SelectionOverlapIndex<'a> {
+    selections: &'a [Selection<Point>],
+    prefixes: Vec<(Point, Option<Point>)>,
+}
+
+impl<'a> SelectionOverlapIndex<'a> {
+    fn new(selections: &'a [Selection<Point>]) -> Self {
+        let mut end = Point::zero();
+        let mut cursor = None;
+        let prefixes = selections
+            .iter()
+            .map(|selection| {
+                end = end.max(selection.end);
+                if selection.is_empty() {
+                    cursor = Some(selection.start);
+                }
+                (end, cursor)
+            })
+            .collect();
+        Self {
+            selections,
+            prefixes,
+        }
+    }
+
+    fn overlaps(&self, range: Range<Point>) -> bool {
+        let closed = self
+            .selections
+            .partition_point(|selection| selection.start <= range.end);
+        let Some((end, cursor)) = closed
+            .checked_sub(1)
+            .and_then(|index| self.prefixes.get(index))
+        else {
+            return false;
+        };
+        if range.is_empty() {
+            return *end >= range.start;
+        }
+        if cursor.is_some_and(|cursor| cursor >= range.start) {
+            return true;
+        }
+        let open = self
+            .selections
+            .partition_point(|selection| selection.start < range.end);
+        open.checked_sub(1)
+            .and_then(|index| self.prefixes.get(index))
+            .is_some_and(|(end, _)| *end > range.start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_selection_overlap_index() {
+        for ranges in [
+            Vec::new(),
+            vec![0..4],
+            vec![0..0, 4..4],
+            vec![0..4, 1..1, 2..3, 4..4],
+        ] {
+            let selections = ranges
+                .into_iter()
+                .enumerate()
+                .map(|(id, range)| Selection {
+                    id,
+                    start: Point::new(0, range.start),
+                    end: Point::new(0, range.end),
+                    reversed: false,
+                    goal: SelectionGoal::None,
+                })
+                .collect::<Vec<_>>();
+            let index = SelectionOverlapIndex::new(&selections);
+            for start in 0..=5 {
+                for end in start..=5 {
+                    let range = Point::new(0, start)..Point::new(0, end);
+                    let expected = selections.iter().any(|selection| {
+                        if range.is_empty() || selection.is_empty() {
+                            range.start <= selection.end && selection.start <= range.end
+                        } else {
+                            range.start < selection.end && selection.start < range.end
+                        }
+                    });
+                    assert_eq!(
+                        index.overlaps(range.clone()),
+                        expected,
+                        "{selections:?}, {range:?}"
+                    );
+                }
+            }
+        }
+        let selections = std::iter::once(0..1000)
+            .chain((1..1000).map(|column| column..column))
+            .enumerate()
+            .map(|(id, range)| Selection {
+                id,
+                start: Point::new(0, range.start),
+                end: Point::new(0, range.end),
+                reversed: false,
+                goal: SelectionGoal::None,
+            })
+            .collect::<Vec<_>>();
+        let index = SelectionOverlapIndex::new(&selections);
+        assert_eq!(
+            (0..1000)
+                .filter(|_| index.overlaps(Point::new(0, 1000)..Point::new(0, 1001)))
+                .count(),
+            0
+        );
+        assert!(index.overlaps(Point::new(0, 1000)..Point::new(0, 1000)));
     }
 }

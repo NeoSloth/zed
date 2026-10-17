@@ -4,7 +4,7 @@ use editor::{
     scroll::ScrollAmount,
 };
 use gpui::{Context, Window, actions};
-use language::Bias;
+use language::Selection;
 use settings::Settings;
 use text::SelectionGoal;
 
@@ -109,7 +109,7 @@ impl Vim {
         self.update_editor(cx, |vim, editor, cx| {
             let should_move_cursor = editor.newest_selection_on_screen(window, cx).is_eq();
             let display_snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
-            let old_top = editor.scroll_top_display_point(&display_snapshot, cx);
+            let old_top = editor.scroll_top_row(&display_snapshot, cx);
 
             if editor.scroll_hover(amount, window, cx) {
                 return;
@@ -138,90 +138,50 @@ impl Vim {
 
             let display_snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
             let text_layout_details = editor.text_layout_details(window, cx);
-            let Some(visible_x) =
-                editor.visible_x_range(&display_snapshot, &text_layout_details, cx)
-            else {
+            let Some(visible_x) = editor.visible_x_range(&display_snapshot, cx) else {
                 return;
             };
-            let top = editor.scroll_top_display_point(&display_snapshot, cx);
+            let top = editor.scroll_top_row(&display_snapshot, cx);
             let vertical_scroll_margin = EditorSettings::get_global(cx).vertical_scroll_margin;
 
             let mut move_cursor = |map: &editor::display_map::DisplaySnapshot,
-                                   mut head: DisplayPoint,
+                                   head: DisplayPoint,
                                    goal: SelectionGoal| {
-                // TODO: Improve the logic and function calls below to be dependent on
-                // the `amount`. If the amount is vertical, we don't care about
-                // columns, while if it's horizontal, we don't care about rows,
-                // so we don't need to calculate both and deal with logic for
-                // both.
                 let max_point = map.max_point();
-                let starting_column = head.column();
 
                 let vertical_scroll_margin =
                     (vertical_scroll_margin as u32).min(visible_line_count as u32 / 2);
 
-                if preserve_cursor_position {
-                    let new_row =
-                        if old_top.row() == top.row() {
-                            DisplayRow(
-                                head.row()
-                                    .0
-                                    .saturating_add_signed(amount.lines(visible_line_count) as i32),
-                            )
-                        } else {
-                            DisplayRow(top.row().0.saturating_add_signed(
-                                head.row().0 as i32 - old_top.row().0 as i32,
-                            ))
-                        };
-                    head = map.clip_point(DisplayPoint::new(new_row, head.column()), Bias::Left)
-                }
-
-                let min_row = if top.row().0 == 0 {
+                let min_row = if top.0 == 0 {
                     DisplayRow(0)
                 } else {
-                    DisplayRow(top.row().0 + vertical_scroll_margin)
+                    DisplayRow(top.0 + vertical_scroll_margin)
                 };
 
-                let max_visible_row = top.row().0.saturating_add(
+                let max_visible_row = top.0.saturating_add(
                     (visible_line_count as u32).saturating_sub(1 + vertical_scroll_margin),
                 );
                 // scroll off the end.
-                let max_row = if top.row().0 + visible_line_count as u32 >= max_point.row().0 {
+                let max_row = if top.0 + visible_line_count as u32 >= max_point.row().0 {
                     max_point.row()
                 } else {
                     DisplayRow(
-                        (top.row().0 + visible_line_count as u32)
+                        (top.0 + visible_line_count as u32)
                             .saturating_sub(1 + vertical_scroll_margin),
                     )
                 };
 
-                let new_row = if full_page_up {
-                    // Special-casing ctrl-b/page-up, which is special-cased by Vim, it seems
-                    // to always put the cursor on the last line of the page, even if the cursor
-                    // was before that.
-                    DisplayRow(max_visible_row)
-                } else if head.row() < min_row {
-                    min_row
-                } else if head.row() > max_row {
-                    max_row
-                } else {
-                    head.row()
-                };
-
-                let visible_columns =
-                    map.visible_display_columns(new_row, visible_x.clone(), &text_layout_details);
-                let (min_column, max_column) = (*visible_columns.start(), *visible_columns.end());
-
-                // Ensure that the cursor's column stays within the visible
-                // area, otherwise clip it at either the left or right edge of
-                // the visible area.
-                let new_column = match (min_column, max_column) {
-                    (min_column, _) if starting_column < min_column => min_column,
-                    (_, max_column) if starting_column > max_column => max_column,
-                    _ => starting_column,
-                };
-
-                let new_head = map.clip_point(DisplayPoint::new(new_row, new_column), Bias::Left);
+                let (new_head, _) = editor::movement::HorizontalMotion::Viewport {
+                    preserve_position: preserve_cursor_position,
+                    old_top,
+                    top,
+                    rows: amount.lines(visible_line_count) as i32,
+                    min_row,
+                    max_row,
+                    force_row: full_page_up.then_some(DisplayRow(max_visible_row)),
+                    visible_x: visible_x.clone(),
+                }
+                .apply(map, head, goal, &text_layout_details);
                 let goal = match amount {
                     ScrollAmount::Column(_) | ScrollAmount::PageWidth(_) => SelectionGoal::None,
                     _ => goal,
@@ -238,7 +198,14 @@ impl Vim {
                     window,
                     cx,
                     |s| {
-                        s.move_with(&mut |map, selection| {
+                        let mut move_selection = |map: &_, selection: &mut Selection<_>| {
+                            text_layout_details.record_horizontal_motion_selection(
+                                if vim.mode.is_visual() {
+                                    editor::movement::HorizontalMotionSelection::ExtendIfNonempty
+                                } else {
+                                    editor::movement::HorizontalMotionSelection::Head
+                                },
+                            );
                             if let Some((new_head, goal)) =
                                 move_cursor(map, selection.head(), selection.goal)
                             {
@@ -248,7 +215,13 @@ impl Vim {
                                     selection.set_head(new_head, goal)
                                 }
                             }
-                        })
+                        };
+                        match amount {
+                            ScrollAmount::Column(_) | ScrollAmount::PageWidth(_) => {
+                                s.move_with(&mut move_selection);
+                            }
+                            _ => s.move_with_horizontal_goals(&mut move_selection),
+                        }
                     },
                 );
             }

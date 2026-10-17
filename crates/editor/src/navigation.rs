@@ -59,7 +59,9 @@ impl Editor {
         let first_selection = self.selections.first_anchor();
 
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_with(&mut |map, selection| {
+            s.move_with_horizontal_goals(&mut |map, selection| {
+                text_layout_details
+                    .record_horizontal_motion_selection(movement::HorizontalMotionSelection::Start);
                 if !selection.is_empty() {
                     selection.goal = SelectionGoal::None;
                 }
@@ -98,7 +100,9 @@ impl Editor {
         let text_layout_details = &self.text_layout_details(window, cx);
 
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_with(&mut |map, selection| {
+            s.move_with_horizontal_goals(&mut |map, selection| {
+                text_layout_details
+                    .record_horizontal_motion_selection(movement::HorizontalMotionSelection::Start);
                 if !selection.is_empty() {
                     selection.goal = SelectionGoal::None;
                 }
@@ -133,7 +137,9 @@ impl Editor {
         let text_layout_details = &self.text_layout_details(window, cx);
 
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_with(&mut |map, selection| {
+            s.move_with_horizontal_goals(&mut |map, selection| {
+                text_layout_details
+                    .record_horizontal_motion_selection(movement::HorizontalMotionSelection::Start);
                 if !selection.is_empty() {
                     selection.goal = SelectionGoal::None;
                 }
@@ -158,7 +164,7 @@ impl Editor {
     ) {
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_heads_with(&mut |map, head, goal| {
+            s.move_heads_with_horizontal_goals(&mut |map, head, goal| {
                 movement::down_by_rows(map, head, action.lines, goal, false, text_layout_details)
             })
         })
@@ -172,7 +178,7 @@ impl Editor {
     ) {
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_heads_with(&mut |map, head, goal| {
+            s.move_heads_with_horizontal_goals(&mut |map, head, goal| {
                 movement::up_by_rows(map, head, action.lines, goal, false, text_layout_details)
             })
         })
@@ -191,7 +197,7 @@ impl Editor {
         let text_layout_details = &self.text_layout_details(window, cx);
 
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_heads_with(&mut |map, head, goal| {
+            s.move_heads_with_horizontal_goals(&mut |map, head, goal| {
                 movement::up_by_rows(map, head, row_count, goal, false, text_layout_details)
             })
         })
@@ -235,7 +241,9 @@ impl Editor {
         let text_layout_details = &self.text_layout_details(window, cx);
 
         self.change_selections(effects, window, cx, |s| {
-            s.move_with(&mut |map, selection| {
+            s.move_with_horizontal_goals(&mut |map, selection| {
+                text_layout_details
+                    .record_horizontal_motion_selection(movement::HorizontalMotionSelection::End);
                 if !selection.is_empty() {
                     selection.goal = SelectionGoal::None;
                 }
@@ -255,7 +263,7 @@ impl Editor {
     pub fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_heads_with(&mut |map, head, goal| {
+            s.move_heads_with_horizontal_goals(&mut |map, head, goal| {
                 movement::up(map, head, goal, false, text_layout_details)
             })
         })
@@ -279,7 +287,9 @@ impl Editor {
         let first_selection = self.selections.first_anchor();
 
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_with(&mut |map, selection| {
+            s.move_with_horizontal_goals(&mut |map, selection| {
+                text_layout_details
+                    .record_horizontal_motion_selection(movement::HorizontalMotionSelection::End);
                 if !selection.is_empty() {
                     selection.goal = SelectionGoal::None;
                 }
@@ -313,7 +323,7 @@ impl Editor {
         let text_layout_details = &self.text_layout_details(window, cx);
 
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_heads_with(&mut |map, head, goal| {
+            s.move_heads_with_horizontal_goals(&mut |map, head, goal| {
                 movement::down_by_rows(map, head, row_count, goal, false, text_layout_details)
             })
         })
@@ -356,7 +366,9 @@ impl Editor {
 
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(effects, window, cx, |s| {
-            s.move_with(&mut |map, selection| {
+            s.move_with_horizontal_goals(&mut |map, selection| {
+                text_layout_details
+                    .record_horizontal_motion_selection(movement::HorizontalMotionSelection::End);
                 if !selection.is_empty() {
                     selection.goal = SelectionGoal::None;
                 }
@@ -376,7 +388,7 @@ impl Editor {
     pub fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
-            s.move_heads_with(&mut |map, head, goal| {
+            s.move_heads_with_horizontal_goals(&mut |map, head, goal| {
                 movement::down(map, head, goal, false, text_layout_details)
             })
         });
@@ -2328,13 +2340,18 @@ impl Editor {
         let cursor_position = cursor_anchor.to_point(&buffer);
         let scroll_anchor = self.scroll_manager.native_anchor(&display_snapshot, cx);
         let scroll_top_row = scroll_anchor.top_row(&buffer);
-        drop(buffer);
+        let horizontal_scroll = self
+            .scroll_manager
+            .serialized_position(&display_snapshot, cx)
+            .horizontal
+            .map(|(point, offset)| (buffer.anchor_before(point), point, offset));
 
         NavigationData {
             cursor_anchor,
             cursor_position,
             scroll_anchor,
             scroll_top_row,
+            horizontal_scroll,
         }
     }
 
