@@ -621,6 +621,15 @@ mod tests {
             "Should query for colors once per save (deduplicated) and once per formatting after save"
         );
 
+        let _buffer_registration = project.update(cx, |project, cx| {
+            let buffer = editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("test editor should have a singleton buffer");
+            project.register_buffer_with_language_servers(&buffer, cx)
+        });
         drop(editor);
         let close = workspace.update_in(cx, |workspace, window, cx| {
             workspace.active_pane().update(cx, |pane, cx| {
@@ -660,11 +669,15 @@ mod tests {
                 .downcast::<Editor>()
                 .expect("Should be an editor")
         });
+        cx.condition(&editor, |editor, cx| {
+            !extract_color_inlays(editor, cx).is_empty()
+        })
+        .await;
 
         assert_eq!(
             2,
             requests_made.load(atomic::Ordering::Acquire),
-            "Cache should be reused on buffer close and reopen"
+            "Cache should be reused while the buffer stays registered"
         );
         editor.update(cx, |editor, cx| {
             assert_eq!(

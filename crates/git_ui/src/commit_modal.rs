@@ -12,7 +12,7 @@ use ui::{
 };
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
-use editor::{Editor, EditorElement};
+use editor::{Editor, EditorElement, MultiBufferOffset, SelectionEffects};
 use gpui::*;
 use util::ResultExt;
 use workspace::{
@@ -68,6 +68,7 @@ pub struct CommitModal {
     properties: ModalContainerProperties,
     branch_list_handle: PopoverMenuHandle<BranchList>,
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
+    _editor_focus_subscription: Subscription,
 }
 
 impl Focusable for CommitModal {
@@ -178,42 +179,29 @@ impl CommitModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let panel = git_panel.read(cx);
-        let suggested_commit_message = panel.suggest_commit_message(cx);
-
-        let commit_editor = git_panel.update(cx, |git_panel, cx| {
-            git_panel.set_modal_open(true, cx);
-            let buffer = git_panel.commit_message_buffer(cx);
-            let panel_editor = git_panel.commit_editor.clone();
-            let project = git_panel.project.clone();
-
-            cx.new(|cx| {
-                let mut editor =
-                    commit_message_editor(buffer, None, project.clone(), false, window, cx);
-                editor.sync_selections(panel_editor, cx).detach();
-
-                editor
-            })
-        });
-
-        let commit_message = commit_editor.read(cx).text(cx);
-
-        if let Some(suggested_commit_message) = suggested_commit_message
-            && commit_message.is_empty()
-        {
-            commit_editor.update(cx, |editor, cx| {
-                editor.set_placeholder_text(&suggested_commit_message, window, cx);
-            });
-        }
-
-        let focus_handle = commit_editor.focus_handle(cx);
-
-        cx.on_focus_out(&focus_handle, window, |this, _, window, cx| {
-            if !this.branch_list_handle.is_focused(window, cx)
-                && !this.commit_menu_handle.is_focused(window, cx)
+        git_panel.update(cx, |panel, cx| panel.set_modal_open(true, cx));
+        let (commit_editor, editor_focus_subscription) =
+            Self::new_commit_editor(&git_panel, None, window, cx);
+        cx.observe_in(&git_panel, window, |modal, panel, window, cx| {
+            let buffer = panel.read(cx).commit_message_buffer(cx);
+            if modal
+                .commit_editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                != Some(buffer)
             {
-                cx.emit(DismissEvent);
+                let was_focused = modal.commit_editor.read(cx).is_focused(window);
+                let (editor, subscription) =
+                    Self::new_commit_editor(&panel, Some(&modal.commit_editor), window, cx);
+                modal.commit_editor = editor;
+                modal._editor_focus_subscription = subscription;
+                if was_focused {
+                    window.focus(&modal.commit_editor.focus_handle(cx), cx);
+                }
             }
+            cx.notify();
         })
         .detach();
 
@@ -226,7 +214,50 @@ impl CommitModal {
             properties,
             branch_list_handle: PopoverMenuHandle::default(),
             commit_menu_handle: PopoverMenuHandle::default(),
+            _editor_focus_subscription: editor_focus_subscription,
         }
+    }
+
+    fn new_commit_editor(
+        git_panel: &Entity<GitPanel>,
+        previous_editor: Option<&Entity<Editor>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<Editor>, Subscription) {
+        let panel = git_panel.read(cx);
+        let buffer = panel.commit_message_buffer(cx);
+        let panel_editor = panel.commit_editor.clone();
+        let project = panel.project.clone();
+        let placeholder = panel.suggest_commit_message(cx).map(SharedString::from);
+        let selections = previous_editor.and_then(|editor| {
+            editor.update(cx, |editor, cx| {
+                (editor.text(cx) == buffer.read(cx).text()).then(|| {
+                    editor
+                        .selections
+                        .all::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                })
+            })
+        });
+        let editor = cx.new(|cx| {
+            let mut editor = commit_message_editor(buffer, placeholder, project, false, window, cx);
+            editor.sync_selections(panel_editor, cx).detach();
+            if let Some(selections) = selections {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |collection| {
+                    collection.select(selections);
+                });
+            }
+            editor
+        });
+        let subscription =
+            cx.on_focus_out(&editor.focus_handle(cx), window, |modal, _, window, cx| {
+                if !modal.commit_editor.read(cx).is_focused(window)
+                    && !modal.branch_list_handle.is_focused(window, cx)
+                    && !modal.commit_menu_handle.is_focused(window, cx)
+                {
+                    cx.emit(DismissEvent);
+                }
+            });
+        (editor, subscription)
     }
 
     fn commit_editor_element(&self, _window: &mut Window, cx: &mut Context<Self>) -> EditorElement {
@@ -456,12 +487,13 @@ impl CommitModal {
                             .disabled(!can_commit)
                             .child(Label::new(commit_label).size(LabelSize::Small).mr_0p5())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                telemetry::event!("Git Committed", source = "Git Modal");
-                                this.git_panel.update(cx, |git_panel, cx| {
+                                if this.git_panel.update(cx, |git_panel, cx| {
                                     let options = git_panel.commit_options();
                                     git_panel.commit_changes(options, window, cx)
-                                });
-                                cx.emit(DismissEvent);
+                                }) {
+                                    telemetry::event!("Git Committed", source = "Git Modal");
+                                    cx.emit(DismissEvent);
+                                }
                             }))
                             .tooltip({
                                 let focus_handle = focus_handle.clone();

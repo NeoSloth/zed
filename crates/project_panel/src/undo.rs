@@ -145,7 +145,7 @@ use std::{collections::VecDeque, sync::Arc};
 use ui::{App, TextSize};
 use util::{paths::PathStyle, rel_path::RelPath};
 use workspace::{
-    Pane, SaveIntent, Workspace,
+    Pane, SaveIntent, SaveOutcome, Workspace,
     notifications::{
         NotificationId, markdown_style, simple_message_notification::MessageNotification,
     },
@@ -938,6 +938,7 @@ impl Inner {
             &mut async_window_cx,
         )
         .await
+        .map(|outcome| matches!(outcome, SaveOutcome::Saved | SaveOutcome::Discarded))
     }
 
     /// Prompts the user to confirm whether they really want to trash all of the

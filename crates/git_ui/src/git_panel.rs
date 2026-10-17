@@ -26,8 +26,8 @@ use db::kvp::KeyValueStore;
 use editor::{Editor, EditorElement, EditorMode, MultiBuffer, MultiBufferOffset, SizingBehavior};
 use editor::{EditorStyle, RewrapOptions};
 use file_icons::FileIcons;
-use futures::StreamExt as _;
 use futures::channel::oneshot::Canceled;
+use futures::{FutureExt as _, StreamExt as _, future::Shared};
 use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
@@ -49,13 +49,13 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
-    ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
-    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task,
-    TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
-    uniform_list,
+    ClipboardItem, DismissEvent, Empty, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    KeyContext, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy,
+    Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored,
+    deferred, uniform_list,
 };
 use itertools::Itertools;
-use language::{Buffer, BufferEvent, File};
+use language::{Buffer, BufferEvent, File, TextBufferSnapshot};
 use language_model::{
     CompletionIntent, Event as LanguageModelEvent, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
@@ -546,7 +546,7 @@ pub enum Event {
     Focus,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SerializedGitPanel {
     #[serde(default)]
     signoff_enabled: bool,
@@ -1153,9 +1153,14 @@ pub struct GitPanel {
     amend_pending: bool,
     original_commit_message: Option<String>,
     pending_commit_message_restores: BTreeMap<String, SerializedCommitMessage>,
+    pending_commit_buffers: HashMap<EntityId, PendingCommitBuffer>,
+    initial_commit_buffer: Option<Entity<Buffer>>,
+    commit_message_conflict_pending: bool,
+    commit_buffer_baselines: HashMap<EntityId, Option<TextBufferSnapshot>>,
     signoff_enabled: bool,
     skip_hooks_enabled: bool,
     pending_serialization: Task<()>,
+    serialization_write: Shared<Task<anyhow::Result<(), Arc<anyhow::Error>>>>,
     pub(crate) project: Entity<Project>,
     scroll_handle: UniformListScrollHandle,
     max_width_item_index: Option<usize>,
@@ -1260,6 +1265,28 @@ pub(crate) fn commit_message_editor(
         }))
     });
     commit_editor
+}
+
+struct PendingCommitBuffer {
+    repository: Entity<Repository>,
+    buffer: Entity<Buffer>,
+    initial_message: SerializedCommitMessage,
+    edited: Rc<Cell<bool>>,
+    prompted: bool,
+    _subscription: Subscription,
+}
+
+impl PendingCommitBuffer {
+    fn is_edited(&self, cx: &App) -> bool {
+        self.edited.get() || self.buffer.read(cx).has_unsaved_edits()
+    }
+
+    fn has_source(&self, cx: &App) -> bool {
+        self.is_edited(cx)
+            || self.initial_message.message.is_some()
+            || self.initial_message.original_message.is_some()
+            || self.initial_message.amend_pending
+    }
 }
 
 impl GitPanel {
@@ -1402,7 +1429,14 @@ impl GitPanel {
             // Once the active git repo is set, this buffer will be replaced.
             let temporary_buffer = cx.new(|cx| Buffer::local(initial_commit_message, cx));
             let commit_editor = cx.new(|cx| {
-                commit_message_editor(temporary_buffer, None, project.clone(), true, window, cx)
+                commit_message_editor(
+                    temporary_buffer.clone(),
+                    None,
+                    project.clone(),
+                    true,
+                    window,
+                    cx,
+                )
             });
 
             let scroll_handle = UniformListScrollHandle::new();
@@ -1489,9 +1523,14 @@ impl GitPanel {
                 amend_pending,
                 original_commit_message,
                 pending_commit_message_restores,
+                pending_commit_buffers: HashMap::default(),
+                initial_commit_buffer: Some(temporary_buffer),
+                commit_message_conflict_pending: false,
+                commit_buffer_baselines: HashMap::default(),
                 signoff_enabled,
                 skip_hooks_enabled: false,
                 pending_serialization: Task::ready(()),
+                serialization_write: Task::ready(Ok(())).shared(),
                 single_staged_entry: None,
                 single_tracked_entry: None,
                 project,
@@ -1941,64 +1980,67 @@ impl GitPanel {
 
     fn serialization_key(workspace: &Workspace) -> Option<String> {
         workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())
+            .serialization_scope()
             .map(|id| format!("{}-{:?}", GIT_PANEL_KEY, id))
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        let signoff_enabled = self.signoff_enabled;
-        let commit_editor_collapsed = self
-            .commit_editor_toggled
-            .then_some(self.commit_editor_collapsed);
-        let commit_messages = self.serialized_commit_messages(cx);
-        let kvp = KeyValueStore::global(cx);
-
+        cx.emit(PanelEvent::PersistenceChanged);
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
             cx.background_executor()
                 .timer(SERIALIZATION_THROTTLE_TIME)
                 .await;
-            let Some(serialization_key) = git_panel
-                .update(cx, |git_panel, cx| {
-                    git_panel
-                        .workspace
-                        .read_with(cx, |workspace, _| Self::serialization_key(workspace))
-                        .ok()
-                        .flatten()
-                })
-                .ok()
-                .flatten()
-            else {
+            let Ok(write) = git_panel.update(cx, |git_panel, cx| {
+                let serialization_key = git_panel
+                    .workspace
+                    .read_with(cx, |workspace, _| Self::serialization_key(workspace))
+                    .ok()
+                    .flatten();
+                git_panel.write_serialized_state(serialization_key, cx)
+            }) else {
                 return;
             };
-            cx.background_spawn(
-                async move {
-                    kvp.write_kvp(
-                        serialization_key,
-                        serde_json::to_string(&SerializedGitPanel {
-                            signoff_enabled,
-                            commit_messages,
-                            commit_editor_collapsed,
-                        })?,
-                    )
-                    .await?;
-                    anyhow::Ok(())
-                }
-                .log_err(),
-            )
-            .await;
+            write.await.log_err();
         });
     }
 
+    fn serialized_state(&self, cx: &App) -> SerializedGitPanel {
+        SerializedGitPanel {
+            signoff_enabled: self.signoff_enabled,
+            commit_messages: self.serialized_commit_messages(cx),
+            commit_editor_collapsed: self
+                .commit_editor_toggled
+                .then_some(self.commit_editor_collapsed),
+        }
+    }
+
+    fn write_serialized_state(
+        &mut self,
+        serialization_key: Option<String>,
+        cx: &App,
+    ) -> Shared<Task<anyhow::Result<(), Arc<anyhow::Error>>>> {
+        let Some(serialization_key) = serialization_key else {
+            return self.serialization_write.clone();
+        };
+        let serialized = self.serialized_state(cx);
+        let previous = self.serialization_write.clone();
+        let kvp = KeyValueStore::global(cx);
+        self.serialization_write = cx
+            .background_spawn(async move {
+                previous.await.log_err();
+                let serialized = serde_json::to_string(&serialized)
+                    .context("serializing git panel")
+                    .map_err(Arc::new)?;
+                kvp.write_kvp(serialization_key, serialized)
+                    .await
+                    .map_err(Arc::new)
+            })
+            .shared();
+        self.serialization_write.clone()
+    }
+
     fn serialized_commit_messages(&self, cx: &App) -> BTreeMap<String, SerializedCommitMessage> {
-        let active_work_directory_abs_path = self.active_repository.as_ref().map(|repository| {
-            repository
-                .read(cx)
-                .work_directory_abs_path
-                .to_string_lossy()
-                .into_owned()
-        });
+        let editor_buffer = self.commit_message_buffer(cx);
         let git_store = self.project.read(cx).git_store().clone();
         let mut commit_messages = self.pending_commit_message_restores.clone();
         for repository in git_store.read(cx).repositories().values() {
@@ -2007,36 +2049,37 @@ impl GitPanel {
                 .work_directory_abs_path
                 .to_string_lossy()
                 .into_owned();
-            if active_work_directory_abs_path.as_deref() == Some(work_directory_abs_path.as_str()) {
+            if self
+                .pending_commit_message_restores
+                .contains_key(&work_directory_abs_path)
+            {
                 continue;
             }
-            if let Some(buffer) = repository.commit_message_buffer() {
-                let text = buffer.read(cx).text();
-                if text.trim().is_empty() {
-                    commit_messages.remove(&work_directory_abs_path);
-                } else {
-                    commit_messages.insert(
-                        work_directory_abs_path,
-                        SerializedCommitMessage {
-                            message: Some(text),
-                            original_message: None,
-                            amend_pending: false,
-                        },
-                    );
-                }
-            }
-        }
-        if let Some(work_directory_abs_path) = active_work_directory_abs_path {
-            let text = self.commit_message_buffer(cx).read(cx).text();
+            let Some(buffer) = repository.commit_message_buffer() else {
+                continue;
+            };
+            let is_editor_buffer = buffer == &editor_buffer;
+            let text = buffer.read(cx).text();
             let trimmed_text = text.trim();
-            let use_buffer_text = !trimmed_text.is_empty()
-                && self
-                    .commit_template
-                    .as_ref()
-                    .is_none_or(|commit_template| commit_template.template.trim() != trimmed_text);
+            let use_buffer_text = match self.commit_buffer_baselines.get(&buffer.entity_id()) {
+                Some(Some(baseline)) => {
+                    baseline.version != buffer.read(cx).version
+                        && !baseline.text_for_range(0..baseline.len()).equals_str(&text)
+                }
+                Some(None) => true,
+                None => {
+                    !trimmed_text.is_empty()
+                        && (!is_editor_buffer
+                            || self.commit_template.as_ref().is_none_or(|commit_template| {
+                                commit_template.template.trim() != trimmed_text
+                            }))
+                }
+            };
             let message = use_buffer_text.then_some(text);
-            let original_message = self.original_commit_message.clone();
-            let amend_pending = self.amend_pending;
+            let original_message = is_editor_buffer
+                .then(|| self.original_commit_message.clone())
+                .flatten();
+            let amend_pending = is_editor_buffer && self.amend_pending;
             if message.is_some() || original_message.is_some() || amend_pending {
                 commit_messages.insert(
                     work_directory_abs_path,
@@ -2049,6 +2092,34 @@ impl GitPanel {
             } else {
                 commit_messages.remove(&work_directory_abs_path);
             }
+        }
+        for pending in self.pending_commit_buffers.values() {
+            if !pending.has_source(cx) {
+                continue;
+            }
+            let work_directory_abs_path = pending
+                .repository
+                .read(cx)
+                .work_directory_abs_path
+                .to_string_lossy()
+                .into_owned();
+            let is_editor_buffer = pending.buffer == editor_buffer;
+            commit_messages.insert(
+                work_directory_abs_path,
+                SerializedCommitMessage {
+                    message: Some(pending.buffer.read(cx).text()),
+                    original_message: if is_editor_buffer {
+                        self.original_commit_message.clone()
+                    } else {
+                        pending.initial_message.original_message.clone()
+                    },
+                    amend_pending: if is_editor_buffer {
+                        self.amend_pending
+                    } else {
+                        pending.initial_message.amend_pending
+                    },
+                },
+            );
         }
         commit_messages
     }
@@ -2481,6 +2552,12 @@ impl GitPanel {
     }
 
     fn focus_editor(&mut self, _: &FocusEditor, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(repository) = self.active_repository.as_ref()
+            && let Some(pending) = self.pending_commit_buffers.get_mut(&repository.entity_id())
+        {
+            pending.prompted = false;
+            self.reopen_commit_buffer(window, cx);
+        }
         self.commit_editor.update(cx, |editor, cx| {
             window.focus(&editor.focus_handle(cx), cx);
         });
@@ -3736,8 +3813,7 @@ impl GitPanel {
     ) -> bool {
         if commit_editor_focus_handle.contains_focused(window, cx) {
             let options = self.commit_options();
-            self.commit_changes(options, window, cx);
-            true
+            self.commit_changes(options, window, cx)
         } else {
             cx.propagate();
             false
@@ -3870,10 +3946,14 @@ impl GitPanel {
         options: CommitOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(active_repository) = self.active_repository.clone() else {
-            return;
+            return false;
         };
+        if !self.has_current_commit_buffer(cx) {
+            self.schedule_update(window, cx);
+            return false;
+        }
         let error_spawn = |message, window: &mut Window, cx: &mut App| {
             let prompt = window.prompt(PromptLevel::Warning, message, None, &["OK"], cx);
             cx.spawn(async move |_| {
@@ -3888,7 +3968,7 @@ impl GitPanel {
                 window,
                 cx,
             );
-            return;
+            return false;
         }
 
         let askpass = self.askpass_delegate("git commit", window, cx);
@@ -3899,7 +3979,7 @@ impl GitPanel {
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx);
-            return;
+            return false;
         };
 
         if self.add_coauthors {
@@ -3921,7 +4001,7 @@ impl GitPanel {
 
             if changed_files.is_empty() && !options.amend {
                 error_spawn("No changes to commit", window, cx);
-                return;
+                return false;
             }
 
             let stage_task =
@@ -3947,6 +4027,9 @@ impl GitPanel {
                         } else {
                             this.commit_editor
                                 .update(cx, |editor, cx| editor.clear(window, cx));
+                            let buffer = this.commit_message_buffer(cx);
+                            this.commit_buffer_baselines
+                                .insert(buffer.entity_id(), Some(buffer.read(cx).text_snapshot()));
                             this.original_commit_message = None;
                             this.serialize(cx);
                         }
@@ -3958,6 +4041,7 @@ impl GitPanel {
         });
 
         self.pending_commit = Some(task);
+        true
     }
 
     pub(crate) fn uncommit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5339,6 +5423,18 @@ impl GitPanel {
                 // restores the pre-amend draft into that repository's buffer.
                 self.set_amend_pending(false, cx);
             }
+            let editor_buffer = self.commit_message_buffer(cx);
+            for pending in self.pending_commit_buffers.values_mut() {
+                if pending.buffer == editor_buffer {
+                    pending.initial_message.original_message = self.original_commit_message.clone();
+                    pending.initial_message.amend_pending = self.amend_pending;
+                }
+            }
+            if let Some(repository) = new_active_repository.as_ref()
+                && let Some(pending) = self.pending_commit_buffers.get_mut(&repository.entity_id())
+            {
+                pending.prompted = false;
+            }
             self.git_access = None;
             self._repo_subscriptions.clear();
             if self.active_tab == GitPanelTab::History {
@@ -5363,112 +5459,338 @@ impl GitPanel {
         });
     }
 
-    fn reopen_commit_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active_repo) = self.active_repository.as_ref() else {
-            self.reopen_commit_buffer_task = Task::ready(());
-            return;
+    fn has_current_commit_buffer(&self, cx: &App) -> bool {
+        let Some(repository) = self.active_repository.as_ref() else {
+            return false;
         };
-        let active_repository_abs_path = active_repo
+        if self.project.read(cx).active_repository(cx).as_ref() != Some(repository) {
+            return false;
+        }
+        let buffer = self.commit_message_buffer(cx);
+        repository.read(cx).commit_message_buffer() == Some(&buffer)
+            || self
+                .pending_commit_buffers
+                .get(&repository.entity_id())
+                .is_some_and(|pending| pending.buffer == buffer)
+    }
+
+    fn set_commit_buffer(
+        &mut self,
+        buffer: Entity<Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_message_buffer(cx) != buffer {
+            let was_focused = self.commit_editor.read(cx).is_focused(window);
+            self.commit_editor = cx.new(|cx| {
+                commit_message_editor(
+                    buffer.clone(),
+                    self.suggest_commit_message(cx).map(SharedString::from),
+                    self.project.clone(),
+                    true,
+                    window,
+                    cx,
+                )
+            });
+            if was_focused {
+                window.focus(&self.commit_editor.focus_handle(cx), cx);
+            }
+        }
+        self._commit_message_buffer_subscription = if self
+            .pending_commit_buffers
+            .values()
+            .any(|pending| pending.buffer == buffer)
+        {
+            None
+        } else {
+            self.commit_buffer_baselines
+                .entry(buffer.entity_id())
+                .or_insert_with(|| {
+                    let buffer = buffer.read(cx);
+                    buffer.is_empty().then(|| buffer.text_snapshot())
+                });
+            Some(cx.subscribe(&buffer, |panel, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    panel.serialize(cx);
+                }
+            }))
+        };
+        cx.notify();
+    }
+
+    fn prepare_pending_commit_buffer(
+        &mut self,
+        repository: &Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repository_id = repository.entity_id();
+        if !self.pending_commit_buffers.contains_key(&repository_id) {
+            let previous_owner = self
+                .pending_commit_buffers
+                .iter()
+                .find_map(|(id, pending)| {
+                    (pending.repository.read(cx).work_directory_abs_path
+                        == repository.read(cx).work_directory_abs_path)
+                        .then_some(*id)
+                });
+            if let Some(previous_owner) = previous_owner
+                && let Some(mut pending) = self.pending_commit_buffers.remove(&previous_owner)
+            {
+                pending.repository = repository.clone();
+                pending.prompted = false;
+                self.pending_commit_buffers.insert(repository_id, pending);
+            }
+        }
+        if !self.pending_commit_buffers.contains_key(&repository_id) {
+            let path = repository
+                .read(cx)
+                .work_directory_abs_path
+                .to_string_lossy()
+                .into_owned();
+            let restored = self.pending_commit_message_restores.get(&path).cloned();
+            if restored.is_none()
+                && self.initial_commit_buffer.is_none()
+                && let Some(buffer) = repository.read(cx).commit_message_buffer().cloned()
+            {
+                if self.commit_message_buffer(cx) != buffer {
+                    self.amend_pending = false;
+                    self.original_commit_message = None;
+                    self.set_commit_buffer(buffer, window, cx);
+                }
+                return;
+            }
+            let initial_message = restored.unwrap_or_default();
+            let initial_text = initial_message.message.clone().unwrap_or_default();
+            let buffer = self
+                .initial_commit_buffer
+                .take()
+                .filter(|buffer| {
+                    buffer.read(cx).has_unsaved_edits() || buffer.read(cx).text() == initial_text
+                })
+                .unwrap_or_else(|| cx.new(|cx| Buffer::local(initial_text, cx)));
+            let edited = Rc::new(Cell::new(buffer.read(cx).has_unsaved_edits()));
+            let subscription = cx.subscribe(&buffer, {
+                let edited = edited.clone();
+                move |panel, _, event, cx| {
+                    if matches!(event, BufferEvent::Edited { .. }) {
+                        edited.set(true);
+                        panel.serialize(cx);
+                    }
+                }
+            });
+            self.pending_commit_buffers.insert(
+                repository_id,
+                PendingCommitBuffer {
+                    repository: repository.clone(),
+                    buffer,
+                    initial_message,
+                    edited,
+                    prompted: false,
+                    _subscription: subscription,
+                },
+            );
+        }
+        if let Some(pending) = self.pending_commit_buffers.get(&repository_id) {
+            if pending.buffer != self.commit_message_buffer(cx) {
+                self.amend_pending = pending.initial_message.amend_pending;
+                self.original_commit_message = pending.initial_message.original_message.clone();
+            }
+            self.set_commit_buffer(pending.buffer.clone(), window, cx);
+        }
+    }
+
+    fn commit_buffer_load_is_current(
+        &self,
+        repository: &Entity<Repository>,
+        buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> bool {
+        self.active_repository.as_ref() == Some(repository)
+            && self.project.read(cx).active_repository(cx).as_ref() == Some(repository)
+            && repository.read(cx).commit_message_buffer() == Some(buffer)
+    }
+
+    fn finish_commit_buffer_load(
+        &mut self,
+        repository: &Entity<Repository>,
+        buffer: &Entity<Buffer>,
+        use_local: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if use_local && let Some(pending) = self.pending_commit_buffers.get(&repository.entity_id())
+        {
+            let text = pending.buffer.read(cx).text();
+            if buffer.read(cx).text() != text {
+                buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+            }
+        }
+        let mut changed = false;
+        if let Some(pending) = self.pending_commit_buffers.remove(&repository.entity_id()) {
+            changed = pending.has_source(cx);
+            if use_local {
+                self.commit_buffer_baselines
+                    .insert(buffer.entity_id(), None);
+                if pending.buffer != self.commit_message_buffer(cx) {
+                    self.amend_pending = pending.initial_message.amend_pending;
+                    self.original_commit_message = pending.initial_message.original_message;
+                }
+            } else {
+                self.amend_pending = false;
+                self.original_commit_message = None;
+            }
+        }
+        let path = repository
             .read(cx)
             .work_directory_abs_path
             .to_string_lossy()
             .into_owned();
-        let load_buffer = active_repo.update(cx, |active_repo, cx| {
+        changed |= self.pending_commit_message_restores.remove(&path).is_some();
+        self.set_commit_buffer(buffer.clone(), window, cx);
+        if changed {
+            self.serialize(cx);
+        }
+    }
+
+    fn reopen_commit_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self.active_repository.clone();
+        if let Some(repository) = repository.as_ref() {
+            self.prepare_pending_commit_buffer(repository, window, cx);
+        }
+        if self.commit_message_conflict_pending {
+            return;
+        }
+        let Some(repository) = repository else {
+            self.reopen_commit_buffer_task = Task::ready(());
+            return;
+        };
+        let load_buffer = repository.update(cx, |repository, cx| {
             let project = self.project.read(cx);
-            active_repo.open_commit_buffer(
+            repository.open_commit_buffer(
                 Some(project.languages().clone()),
                 project.buffer_store().clone(),
                 cx,
             )
         });
         let load_template = self.load_commit_template(cx);
-
-        self.reopen_commit_buffer_task = cx.spawn_in(window, async move |git_panel, cx| {
-            let result = async {
-                // Set up the buffer before awaiting the commit template as the
-                // request may never resolve (for example, a collab host that
-                // doesn't know about `LoadCommitTemplate`) and must not block the
-                // commit editor from attaching to the shared buffer.
-                let buffer = load_buffer.await?;
-                git_panel.update_in(cx, |git_panel, window, cx| {
-                    if git_panel
-                        .commit_editor
-                        .read(cx)
-                        .buffer()
-                        .read(cx)
-                        .as_singleton()
-                        .as_ref()
-                        != Some(&buffer)
-                    {
-                        git_panel.commit_editor = cx.new(|cx| {
-                            commit_message_editor(
-                                buffer.clone(),
-                                git_panel.suggest_commit_message(cx).map(SharedString::from),
-                                git_panel.project.clone(),
-                                true,
-                                window,
-                                cx,
-                            )
-                        });
-                    }
-
-                    // Create subscription such that, any edit on the commit
-                    // editor's buffer will be serialized and saved to the database
-                    // in order to be able to restore it in case there's a
-                    // disconnect.
-                    git_panel._commit_message_buffer_subscription =
-                        Some(cx.subscribe(&buffer, |git_panel, _, event, cx| {
-                            if matches!(event, BufferEvent::Edited { .. }) {
-                                git_panel.serialize(cx);
-                            }
-                        }));
-                })?;
-
-                // Check whether there's a pending commit message for this
-                // repository and, if that's the case, update the buffer's
-                // text.
-                git_panel.update(cx, |git_panel, cx| {
-                    if let Some(restored_commit_message) = git_panel
-                        .pending_commit_message_restores
-                        .remove(&active_repository_abs_path)
-                    {
-                        git_panel.amend_pending = restored_commit_message.amend_pending;
-                        git_panel.original_commit_message =
-                            restored_commit_message.original_message;
-                        cx.notify();
-
-                        if let Some(message) = restored_commit_message.message
-                            && buffer.read(cx).text().trim().is_empty()
-                        {
-                            buffer.update(cx, |buffer, cx| {
-                                buffer.set_text(message, cx);
-                            });
-                        }
-                    }
-                })?;
-
-                // Only apply the template if it's non-empty and the buffer has no
-                // content, so we never override a commit message that was already
-                // in progress.
-                let commit_template = load_template.await?;
-                git_panel.update(cx, |git_panel, cx| {
-                    git_panel.commit_template = commit_template;
-
-                    if let Some(commit_template) = git_panel.commit_template.as_ref()
-                        && !commit_template.template.is_empty()
-                        && buffer.read(cx).text().trim().is_empty()
-                    {
-                        buffer.update(cx, |buffer, cx| {
-                            buffer.set_text(commit_template.template.clone(), cx);
-                        });
-                    }
-                })?;
-
-                anyhow::Ok(())
+        self.reopen_commit_buffer_task = cx.spawn_in(window, async move |panel, cx| {
+            let Some(buffer) = load_buffer.await.log_err() else {
+                return;
+            };
+            let Ok(current) = panel.read_with(cx, |panel, cx| {
+                panel.commit_buffer_load_is_current(&repository, &buffer, cx)
+            }) else {
+                return;
+            };
+            if !current {
+                return;
             }
-            .await;
-
-            result.log_err();
+            let Ok(source) = panel.read_with(cx, |panel, cx| {
+                panel.pending_commit_buffers.get(&repository.entity_id()).map(|pending| (
+                    pending.buffer.clone(),
+                    pending.initial_message.message.clone().unwrap_or_default(),
+                    pending.has_source(cx),
+                    pending.is_edited(cx),
+                    pending.prompted,
+                ))
+            }) else {
+                return;
+            };
+            let use_local = source.as_ref().is_some_and(|(_, _, has_source, _, _)| *has_source);
+            if let Some((source_buffer, initial_text, true, edited, prompted)) = source {
+                let local_text = source_buffer.read_with(cx, |buffer, _| buffer.text());
+                let repository_text = buffer.read_with(cx, |buffer, _| buffer.text());
+                if !repository_text.is_empty() && repository_text != initial_text && repository_text != local_text {
+                    if prompted {
+                        return;
+                    }
+                    let local_version = source_buffer.read_with(cx, |buffer, _| buffer.version());
+                    let repository_version = buffer.read_with(cx, |buffer, _| buffer.version());
+                    let Ok(prompt) = panel.update_in(cx, |panel, window, cx| {
+                        panel.commit_message_conflict_pending = true;
+                        if let Some(pending) = panel.pending_commit_buffers.get_mut(&repository.entity_id()) {
+                            pending.prompted = true;
+                        }
+                        let repository_path = repository.read(cx).work_directory_abs_path.to_string_lossy();
+                        let detail = format!("Repository: {repository_path}\n\nLocal draft:\n{local_text}\n\nRepository draft:\n{repository_text}\n\nCancel keeps your local draft without replacing the repository draft.\nUse the Focus Editor action to choose again.");
+                        window.prompt(
+                            PromptLevel::Warning,
+                            "The repository has a different commit draft.",
+                            Some(&detail),
+                            &[if edited { "Use Edited Draft" } else { "Use Restored Draft" }, "Keep Repository Draft", "Cancel"],
+                            cx,
+                        )
+                    }) else {
+                        return;
+                    };
+                    let answer = prompt.await;
+                    let Ok(resolved) = panel.update_in(cx, |panel, window, cx| {
+                        panel.commit_message_conflict_pending = false;
+                        if let Some(pending) = panel.pending_commit_buffers.get_mut(&repository.entity_id())
+                            && pending.buffer == source_buffer
+                        {
+                            pending.prompted = true;
+                        }
+                        if !panel.commit_buffer_load_is_current(&repository, &buffer, cx) {
+                            if panel.active_repository.as_ref() != Some(&repository) {
+                                panel.reopen_commit_buffer(window, cx);
+                            }
+                            return false;
+                        }
+                        if !panel.pending_commit_buffers.get(&repository.entity_id())
+                            .is_some_and(|pending| pending.buffer == source_buffer)
+                            || source_buffer.read(cx).version() != local_version
+                            || buffer.read(cx).version() != repository_version
+                            || source_buffer.read(cx).text() != local_text
+                            || buffer.read(cx).text() != repository_text
+                        {
+                            return false;
+                        }
+                        let use_local = match answer {
+                            Ok(0) => true,
+                            Ok(1) => false,
+                            _ => return false,
+                        };
+                        panel.finish_commit_buffer_load(&repository, &buffer, use_local, window, cx);
+                        true
+                    }) else {
+                        return;
+                    };
+                    if !resolved {
+                        return;
+                    }
+                } else if panel.update_in(cx, |panel, window, cx| {
+                    panel.finish_commit_buffer_load(&repository, &buffer, true, window, cx);
+                }).is_err() {
+                    return;
+                }
+            } else if panel.update_in(cx, |panel, window, cx| {
+                panel.finish_commit_buffer_load(&repository, &buffer, use_local, window, cx);
+            }).is_err() {
+                return;
+            }
+            let version = buffer.read_with(cx, |buffer, _| buffer.version());
+            let Some(commit_template) = load_template.await.log_err() else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                if !panel.commit_buffer_load_is_current(&repository, &buffer, cx) {
+                    return;
+                }
+                panel.commit_template = commit_template;
+                if panel.commit_buffer_baselines.get(&buffer.entity_id())
+                    .and_then(Option::as_ref)
+                    .is_some_and(|baseline| baseline.version == buffer.read(cx).version)
+                    && buffer.read(cx).version() == version
+                    && buffer.read(cx).text().is_empty()
+                    && let Some(template) = panel.commit_template.as_ref()
+                    && !template.template.is_empty()
+                {
+                    buffer.update(cx, |buffer, cx| buffer.set_text(template.template.clone(), cx));
+                    panel.commit_buffer_baselines.insert(buffer.entity_id(), Some(buffer.read(cx).text_snapshot()));
+                }
+            }).ok();
         });
     }
 
@@ -6499,7 +6821,9 @@ impl GitPanel {
     }
 
     pub fn configure_commit_button(&self, cx: &mut Context<Self>) -> (bool, &'static str) {
-        if self.generate_commit_message_task.is_some() {
+        if !self.has_current_commit_buffer(cx) {
+            (false, "Loading commit message...")
+        } else if self.generate_commit_message_task.is_some() {
             (false, "Generating commit message...")
         } else if self.has_unstaged_conflicts() {
             (false, "You must resolve conflicts before committing")
@@ -9515,6 +9839,18 @@ impl Panel for GitPanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
+    fn flush_serialization(
+        &mut self,
+        workspace: &Workspace,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.pending_serialization = Task::ready(());
+        let write = self.write_serialized_state(Self::serialization_key(workspace), cx);
+        cx.background_spawn(
+            async move { write.await.map_err(|error| anyhow::anyhow!("{error:#}")) },
+        )
+    }
+
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
             settings.git_panel.get_or_insert_default().dock = Some(position.into())
@@ -10085,6 +10421,7 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
 
 #[cfg(test)]
 mod tests {
+    use db::AppDatabase;
     use editor::SplittableEditor;
     use git::{
         repository::repo_path,
@@ -12724,17 +13061,42 @@ mod tests {
         let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
 
         register_git_commit_language(&project, cx);
-        let panel = workspace.update_in(cx, GitPanel::new);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
         cx.run_until_parked();
+        let persistence_changes = Rc::new(Cell::new(0));
+        let _subscription = panel.update(cx, |_, cx| {
+            let persistence_changes = persistence_changes.clone();
+            cx.subscribe(&panel, move |_, _, event: &PanelEvent, _| {
+                if let PanelEvent::PersistenceChanged = event {
+                    persistence_changes.set(persistence_changes.get() + 1);
+                }
+            })
+        });
 
         let message_a = "Restore repository A message";
-        panel.update(cx, |panel, cx| {
-            panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
-                let start = buffer.anchor_before(0);
-                let end = buffer.anchor_after(buffer.len());
-                buffer.edit([(start..end, message_a)], None, cx);
+        workspace.update(cx, |_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                    let start = buffer.anchor_before(0);
+                    let end = buffer.anchor_after(buffer.len());
+                    buffer.edit([(start..end, message_a)], None, cx);
+                });
             });
         });
+        cx.run_until_parked();
+        assert_eq!(persistence_changes.get(), 1);
+        workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(persistence_changes.get(), 1);
 
         repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
         cx.run_until_parked();
@@ -12881,6 +13243,17 @@ mod tests {
             );
         });
 
+        panel.update(cx, |panel, cx| {
+            panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                buffer.finalize_last_transaction();
+                buffer.edit([(0..0, "x")], None, cx);
+                assert_eq!(buffer.text(), "xTemplate1\n");
+                assert!(buffer.undo(cx).is_some());
+                assert_eq!(buffer.text(), "Template1\n");
+            });
+        });
+        cx.run_until_parked();
+
         // Update the commit template returned by the fake git repository and
         // simulate restart: empty the active commit buffer and reload the panel
         // from the same serialized state the previous session would have written.
@@ -13017,6 +13390,1083 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_commit_template_baselines_preserve_exact_edits_in_all_repositories(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project-a": {".git": {}, "file.txt": "a"},
+                "project-b": {".git": {}, "file.txt": "b"},
+            }),
+        )
+        .await;
+        fs.with_git_state(Path::new(path!("/root/project-b/.git")), false, |state| {
+            state.commit_template = Some(GitCommitTemplate {
+                template: "Témplate\n".to_string(),
+            });
+        })
+        .expect("repository should exist");
+        let project = Project::test(
+            fs,
+            [
+                Path::new(path!("/root/project-a")),
+                Path::new(path!("/root/project-b")),
+            ],
+            cx,
+        )
+        .await;
+        let repositories = project.read_with(cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .repositories()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("window should exist");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        register_git_commit_language(&project, cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        for repository in &repositories {
+            repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(repositories.len(), 2);
+        for repository in &repositories {
+            let (path, buffer) = repository.read_with(cx, |repository, _| {
+                (
+                    repository
+                        .work_directory_abs_path
+                        .to_string_lossy()
+                        .into_owned(),
+                    repository
+                        .commit_message_buffer()
+                        .expect("buffer should be loaded")
+                        .clone(),
+                )
+            });
+            let template = if path == path!("/root/project-a") {
+                ""
+            } else {
+                "Témplate\n"
+            };
+            assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), template);
+            for message in ["", " \t\n", "Témplate\n ", "新しい下書き"] {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.finalize_last_transaction();
+                    buffer.edit([(0..buffer.len(), message)], None, cx);
+                });
+                let expected = if message.is_empty() && template.is_empty() {
+                    json!({})
+                } else {
+                    json!({(path.clone()): {"message": message, "amend_pending": false}})
+                };
+                assert_eq!(
+                    panel.read_with(cx, |panel, cx| serde_json::to_value(
+                        panel.serialized_commit_messages(cx)
+                    )
+                    .expect("drafts should serialize")),
+                    expected,
+                );
+                if message != template {
+                    buffer.update(cx, |buffer, cx| {
+                        assert!(buffer.undo(cx).is_some());
+                        assert_eq!(buffer.text(), template);
+                    });
+                    assert_eq!(
+                        panel.read_with(cx, |panel, cx| panel.serialized_commit_messages(cx).len()),
+                        0
+                    );
+                    buffer.update(cx, |buffer, cx| {
+                        assert!(buffer.redo(cx).is_some());
+                        assert_eq!(buffer.text(), message);
+                    });
+                    assert_eq!(
+                        panel.read_with(cx, |panel, cx| serde_json::to_value(
+                            panel.serialized_commit_messages(cx)
+                        )
+                        .expect("drafts should serialize")),
+                        expected,
+                    );
+                    buffer.update(cx, |buffer, cx| {
+                        assert!(buffer.undo(cx).is_some());
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_commit_draft_writes_order_debounce_and_repeated_close(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window, workspace, panel) = init_persistent_git_panel(cx).await;
+        let key = workspace.read_with(cx, |workspace, _| {
+            GitPanel::serialization_key(workspace).expect("workspace should have a key")
+        });
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .expect("initial flush should succeed");
+        let saved = kvp.read_kvp(&key).expect("panel should be readable");
+        let buffer = panel.read_with(cx, |panel, cx| panel.commit_message_buffer(cx));
+        let (release, pending) = futures::channel::oneshot::channel::<()>();
+        let previous = panel.update(cx, |panel, cx| {
+            panel.serialization_write = cx
+                .background_spawn(async move {
+                    pending
+                        .await
+                        .map_err(|error| Arc::new(anyhow::Error::from(error)))
+                })
+                .shared();
+            panel.serialization_write.clone()
+        });
+        buffer.update(cx, |buffer, cx| buffer.set_text("older draft", cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        let debounced = panel.read_with(cx, |panel, _| panel.serialization_write.clone());
+        assert!(debounced.clone().now_or_never().is_none());
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.close_window(&workspace::CloseWindow, window, cx)
+            })
+            .expect("window should exist");
+        cx.run_until_parked();
+        buffer.update(cx, |buffer, cx| buffer.set_text("newest draft", cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+        cx.run_until_parked();
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.close_window(&workspace::CloseWindow, window, cx)
+            })
+            .expect("window should still exist");
+        cx.run_until_parked();
+        let latest = panel.read_with(cx, |panel, _| panel.serialization_write.clone());
+        assert!(latest.clone().now_or_never().is_none());
+        assert_eq!(kvp.read_kvp(&key).expect("panel should be readable"), saved);
+        release
+            .send(())
+            .expect("earlier writes should remain retained");
+        previous.await.expect("write gate should finish");
+        latest.await.expect("latest write should finish");
+        cx.run_until_parked();
+        let serialized = kvp
+            .read_kvp(&key)
+            .expect("panel should be readable")
+            .expect("panel should be saved");
+        let serialized = serde_json::from_str::<serde_json::Value>(&serialized)
+            .expect("panel should be valid JSON");
+        assert_eq!(
+            serialized["commit_messages"],
+            json!({
+                (path!("/root/project")): {"message": "newest draft", "amend_pending": false}
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_commit_draft_flush_retries_errors_and_retains_cancelled_waiters(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, workspace, panel) = init_persistent_git_panel(cx).await;
+        let key = workspace.read_with(cx, |workspace, _| {
+            GitPanel::serialization_key(workspace).expect("workspace should have a key")
+        });
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .expect("initial flush should succeed");
+        let saved = kvp.read_kvp(&key).expect("panel should be readable");
+        kvp.write(|connection| connection.exec("CREATE TRIGGER fail_git_panel_write BEFORE INSERT ON kv_store BEGIN SELECT RAISE(ABORT, 'git panel write failed'); END")?()).await.expect("failure trigger should be created");
+        let buffer = panel.read_with(cx, |panel, cx| panel.commit_message_buffer(cx));
+        buffer.update(cx, |buffer, cx| buffer.set_text("retried draft", cx));
+        let failed = workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(kvp.read_kvp(&key).expect("panel should be readable"), saved);
+        kvp.write(|connection| connection.exec("DROP TRIGGER fail_git_panel_write")?())
+            .await
+            .expect("failure trigger should be removed");
+        drop(workspace.update(cx, |workspace, cx| {
+            panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+        }));
+        cx.run_until_parked();
+        let serialized = kvp
+            .read_kvp(&key)
+            .expect("panel should be readable")
+            .expect("panel should be saved");
+        let serialized = serde_json::from_str::<serde_json::Value>(&serialized)
+            .expect("panel should be valid JSON");
+        assert_eq!(
+            serialized["commit_messages"],
+            json!({
+                (path!("/root/project")): {"message": "retried draft", "amend_pending": false}
+            })
+        );
+        workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .expect("retry should not retain the previous error");
+    }
+
+    #[gpui::test]
+    async fn test_initial_commit_buffer_draft_survives_loading(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        for (
+            saved_message,
+            edited_message,
+            loaded_message,
+            switch_repository,
+            expected_serialized_message,
+            expected_loaded_message,
+        ) in [
+            (
+                Some("saved"),
+                Some("edited"),
+                None,
+                false,
+                Some("edited"),
+                "edited",
+            ),
+            (
+                None,
+                Some("new draft"),
+                None,
+                false,
+                Some("new draft"),
+                "new draft",
+            ),
+            (Some("saved"), Some(""), None, false, Some(""), ""),
+            (
+                Some("saved"),
+                Some("edited"),
+                None,
+                true,
+                Some("edited"),
+                "edited",
+            ),
+            (Some("saved"), None, None, false, Some("saved"), "saved"),
+            (
+                Some("saved"),
+                Some("edited"),
+                Some("saved"),
+                false,
+                Some("edited"),
+                "edited",
+            ),
+            (Some("saved"), Some(""), Some("saved"), false, Some(""), ""),
+            (Some(""), None, None, false, Some(""), ""),
+            (None, None, None, false, None, "Template\n"),
+            (
+                None,
+                None,
+                Some("independent"),
+                false,
+                Some("independent"),
+                "independent",
+            ),
+            (
+                Some("saved"),
+                Some("edited"),
+                Some("edited"),
+                false,
+                Some("edited"),
+                "edited",
+            ),
+        ] {
+            let fs = FakeFs::new(cx.background_executor.clone());
+            fs.insert_tree(
+                "/root",
+                json!({
+                    "project-a": {".git": {}, "file.txt": "a"},
+                    "project-b": {".git": {}, "file.txt": "b"},
+                }),
+            )
+            .await;
+            let project = Project::test(
+                fs.clone(),
+                [
+                    Path::new(path!("/root/project-a")),
+                    Path::new(path!("/root/project-b")),
+                ],
+                cx,
+            )
+            .await;
+            let (repository_a, repository_b) = project.read_with(cx, |project, cx| {
+                let repositories = project.git_store().read(cx).repositories();
+                let find_repository = |path: &Path| {
+                    repositories
+                        .values()
+                        .find(|repository| {
+                            repository.read(cx).work_directory_abs_path.as_ref() == path
+                        })
+                        .expect("repository should exist")
+                        .clone()
+                };
+                (
+                    find_repository(Path::new(path!("/root/project-a"))),
+                    find_repository(Path::new(path!("/root/project-b"))),
+                )
+            });
+            repository_a.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+            let window_handle =
+                cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            let workspace = window_handle
+                .read_with(cx, |workspace, _| workspace.workspace().clone())
+                .expect("workspace should exist");
+            let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+            register_git_commit_language(&project, cx);
+            if let Some(loaded_message) = loaded_message {
+                let buffer = repository_a
+                    .update(cx, |repository, cx| {
+                        let project = project.read(cx);
+                        repository.open_commit_buffer(
+                            Some(project.languages().clone()),
+                            project.buffer_store().clone(),
+                            cx,
+                        )
+                    })
+                    .await
+                    .expect("commit buffer should load");
+                buffer.update(cx, |buffer, cx| buffer.set_text(loaded_message, cx));
+            }
+            fs.with_git_state(Path::new(path!("/root/project-a/.git")), false, |state| {
+                state.commit_template = Some(GitCommitTemplate {
+                    template: "Template\n".to_string(),
+                });
+            })
+            .expect("repository state should exist");
+            let (release_buffer, buffer_gate) = futures::channel::oneshot::channel::<()>();
+            let blocked_job = repository_a.update(cx, |repository, _| {
+                repository.send_job("block initial commit buffer", None, |_, _| async move {
+                    buffer_gate.await.expect("buffer gate should be released");
+                })
+            });
+            let (panel, flush) = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.set_random_database_id();
+                let mut commit_messages = BTreeMap::from_iter([(
+                    path!("/root/project-b").to_string(),
+                    SerializedCommitMessage {
+                        message: Some("Draft for B".to_string()),
+                        ..SerializedCommitMessage::default()
+                    },
+                )]);
+                if let Some(saved_message) = saved_message {
+                    commit_messages.insert(
+                        path!("/root/project-a").to_string(),
+                        SerializedCommitMessage {
+                            message: Some(saved_message.to_string()),
+                            ..SerializedCommitMessage::default()
+                        },
+                    );
+                }
+                let panel = GitPanel::new_with_serialized_panel(
+                    workspace,
+                    Some(SerializedGitPanel {
+                        commit_messages,
+                        ..SerializedGitPanel::default()
+                    }),
+                    window,
+                    cx,
+                );
+                let flush = panel.update(cx, |panel, cx| {
+                    assert_eq!(panel.active_repository.as_ref(), Some(&repository_a));
+                    assert!(!panel.commit_editor.read(cx).read_only(cx));
+                    assert_eq!(
+                        panel.commit_message_buffer(cx).read(cx).text(),
+                        saved_message.unwrap_or_default()
+                    );
+                    if let Some(edited_message) = edited_message {
+                        panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                            buffer.set_text(edited_message, cx);
+                        });
+                    }
+                    assert_eq!(
+                        panel
+                            .serialized_commit_messages(cx)
+                            .get(path!("/root/project-a"))
+                            .and_then(|message| message.message.as_deref()),
+                        expected_serialized_message,
+                    );
+                    panel.flush_serialization(workspace, cx)
+                });
+                (panel, flush)
+            });
+            flush.await.expect("initial draft should flush");
+            if switch_repository {
+                repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+                cx.run_until_parked();
+                panel.read_with(cx, |panel, cx| {
+                    assert_eq!(panel.active_repository.as_ref(), Some(&repository_b));
+                    assert_eq!(
+                        panel.commit_message_buffer(cx).read(cx).text(),
+                        "Draft for B"
+                    );
+                });
+                workspace
+                    .update(cx, |workspace, cx| {
+                        panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+                    })
+                    .await
+                    .expect("switched draft should flush");
+            }
+            if loaded_message.is_none() {
+                assert!(repository_a.read_with(cx, |repository, _| {
+                    repository.commit_message_buffer().is_none()
+                }));
+                let key = workspace.read_with(cx, |workspace, _| {
+                    GitPanel::serialization_key(workspace)
+                        .expect("workspace should have a persistence key")
+                });
+                let kvp = cx.update(|_, cx| KeyValueStore::global(cx));
+                let serialized = cx
+                    .background_spawn(async move { kvp.read_kvp(&key) })
+                    .await
+                    .expect("panel state should be readable")
+                    .expect("panel state should be saved");
+                let serialized = serde_json::from_str::<SerializedGitPanel>(&serialized)
+                    .expect("panel state should be valid");
+                assert_eq!(
+                    serialized
+                        .commit_messages
+                        .get(path!("/root/project-a"))
+                        .and_then(|message| message.message.as_deref()),
+                    expected_serialized_message,
+                );
+                assert_eq!(
+                    serialized
+                        .commit_messages
+                        .get(path!("/root/project-b"))
+                        .and_then(|message| message.message.as_deref()),
+                    Some("Draft for B"),
+                );
+            }
+            release_buffer
+                .send(())
+                .expect("buffer should still be loading");
+            blocked_job.await.expect("blocked job should finish");
+            cx.run_until_parked();
+            if switch_repository {
+                repository_a.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+                cx.run_until_parked();
+            }
+            panel.read_with(cx, |panel, cx| {
+                assert_eq!(panel.active_repository.as_ref(), Some(&repository_a));
+                assert_eq!(
+                    panel.commit_message_buffer(cx).read(cx).text(),
+                    expected_loaded_message
+                );
+                assert_eq!(
+                    repository_a.read(cx).commit_message_buffer(),
+                    Some(&panel.commit_message_buffer(cx)),
+                );
+                assert_eq!(
+                    panel
+                        .serialized_commit_messages(cx)
+                        .get(path!("/root/project-a"))
+                        .and_then(|message| message.message.as_deref()),
+                    if expected_loaded_message == "Template\n" {
+                        None
+                    } else {
+                        Some(expected_loaded_message)
+                    },
+                );
+            });
+            assert!(!cx.has_pending_prompt());
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(workspace.items_of_type::<Editor>(cx).count(), 0);
+            });
+            if expected_loaded_message == "Template\n" {
+                panel.update(cx, |panel, cx| {
+                    panel
+                        .commit_message_buffer(cx)
+                        .update(cx, |buffer, cx| buffer.set_text("", cx));
+                    assert_eq!(
+                        panel.serialized_commit_messages(cx)[path!("/root/project-a")]
+                            .message
+                            .as_deref(),
+                        Some("")
+                    );
+                });
+            }
+            if expected_loaded_message.is_empty() || expected_loaded_message == "Template\n" {
+                let serialized = panel.read_with(cx, |panel, cx| panel.serialized_state(cx));
+                drop(panel);
+                let restored_panel = workspace.update_in(cx, |workspace, window, cx| {
+                    GitPanel::new_with_serialized_panel(workspace, Some(serialized), window, cx)
+                });
+                cx.run_until_parked();
+                assert!(!cx.has_pending_prompt());
+                restored_panel.read_with(cx, |panel, cx| {
+                    assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "");
+                    assert_eq!(
+                        panel.serialized_commit_messages(cx)[path!("/root/project-a")]
+                            .message
+                            .as_deref(),
+                        Some("")
+                    );
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_commit_modal_tracks_pending_and_rootless_buffers(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        for start_rootless in [false, true] {
+            let (_, project, workspace, initial_panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({".git": {}, "file": "modified\n"}),
+                &[("file", StatusCode::Modified)],
+            )
+            .await;
+            drop(initial_panel);
+            register_git_commit_language(&project, &mut cx);
+            let load_gate = if start_rootless {
+                project.update(&mut cx, |project, cx| {
+                    project.remove_worktree_for_main_worktree_path(path!("/project"), cx);
+                });
+                cx.run_until_parked();
+                assert!(
+                    project
+                        .read_with(&cx, |project, cx| project.active_repository(cx))
+                        .is_none()
+                );
+                None
+            } else {
+                let repository = project.read_with(&cx, |project, cx| {
+                    project
+                        .active_repository(cx)
+                        .expect("repository should exist")
+                });
+                let (release, gate) = futures::channel::oneshot::channel::<()>();
+                let blocked_job = repository.update(&mut cx, |repository, _| {
+                    repository.send_job("block modal commit buffer", None, |_, _| async move {
+                        gate.await.expect("buffer gate should be released");
+                    })
+                });
+                Some((release, blocked_job))
+            };
+            let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+                workspace.set_random_database_id();
+                let panel = GitPanel::new(workspace, window, cx);
+                workspace.add_panel(panel.clone(), window, cx);
+                CommitModal::toggle(workspace, None, window, cx);
+                panel
+            });
+            cx.run_until_parked();
+            let modal = workspace.read_with(&cx, |workspace, cx| {
+                workspace
+                    .active_modal::<CommitModal>(cx)
+                    .expect("commit modal should be open")
+            });
+            cx.simulate_input("before");
+            let initial_buffer = panel.read_with(&cx, |panel, cx| {
+                assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "before");
+                panel.commit_message_buffer(cx)
+            });
+            if let Some((release, blocked_job)) = load_gate {
+                release.send(()).expect("buffer should still be loading");
+                blocked_job.await.expect("blocked job should finish");
+            } else {
+                let (worktree, _) = project
+                    .update(&mut cx, |project, cx| {
+                        project.find_or_create_worktree(path!("/project"), true, cx)
+                    })
+                    .await
+                    .expect("worktree should open");
+                worktree
+                    .read_with(&cx, |worktree, _| {
+                        worktree
+                            .as_local()
+                            .expect("worktree should be local")
+                            .scan_complete()
+                    })
+                    .await;
+            }
+            cx.run_until_parked();
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.active_modal::<CommitModal>(cx),
+                    Some(modal.clone())
+                );
+            });
+            cx.simulate_input(" after");
+            panel.read_with(&cx, |panel, cx| {
+                assert_ne!(panel.commit_message_buffer(cx), initial_buffer);
+                assert_eq!(
+                    panel.commit_message_buffer(cx).read(cx).text(),
+                    "before after"
+                );
+                assert_eq!(
+                    panel.serialized_commit_messages(cx)[path!("/project")]
+                        .message
+                        .as_deref(),
+                    Some("before after")
+                );
+            });
+            workspace
+                .update(&mut cx, |workspace, cx| {
+                    panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+                })
+                .await
+                .expect("modal draft should flush");
+            let key = workspace.read_with(&cx, |workspace, _| {
+                GitPanel::serialization_key(workspace)
+                    .expect("workspace should have a persistence key")
+            });
+            let kvp = cx.update(|_, cx| KeyValueStore::global(cx));
+            let serialized = cx
+                .background_spawn(async move { kvp.read_kvp(&key) })
+                .await
+                .expect("panel state should be readable")
+                .expect("panel state should be saved");
+            let serialized = serde_json::from_str::<SerializedGitPanel>(&serialized)
+                .expect("panel state should deserialize");
+            assert_eq!(
+                serialized.commit_messages[path!("/project")]
+                    .message
+                    .as_deref(),
+                Some("before after")
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_commit_draft_conflict_choices_and_cancelled_restart(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        for (edited, answer, expected_local, expected_repository, resolved) in [
+            (None, "Use Restored Draft", "saved", "saved", true),
+            (Some("typed"), "Use Edited Draft", "typed", "typed", true),
+            (
+                None,
+                "Keep Repository Draft",
+                "independent",
+                "independent",
+                true,
+            ),
+            (Some(""), "Use Edited Draft", "", "", true),
+            (None, "Cancel", "saved", "independent", false),
+            (Some(""), "Cancel", "", "independent", false),
+        ] {
+            let (fs, project, workspace, initial_panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({".git": {}, "file": "modified\n"}),
+                &[("file", StatusCode::Modified)],
+            )
+            .await;
+            register_git_commit_language(&project, &mut cx);
+            initial_panel.update_in(&mut cx, |panel, window, cx| {
+                panel.reopen_commit_buffer(window, cx)
+            });
+            cx.run_until_parked();
+            let repository_buffer = project.read_with(&cx, |project, cx| {
+                project
+                    .active_repository(cx)
+                    .expect("repository should exist")
+                    .read(cx)
+                    .commit_message_buffer()
+                    .expect("commit buffer should load")
+                    .clone()
+            });
+            drop(initial_panel);
+            repository_buffer.update(&mut cx, |buffer, cx| buffer.set_text("independent", cx));
+            let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+                workspace.set_random_database_id();
+                let panel = GitPanel::new_with_serialized_panel(
+                    workspace,
+                    Some(SerializedGitPanel {
+                        commit_messages: BTreeMap::from_iter([(
+                            path!("/project").to_string(),
+                            SerializedCommitMessage {
+                                message: Some("saved".to_string()),
+                                ..SerializedCommitMessage::default()
+                            },
+                        )]),
+                        ..SerializedGitPanel::default()
+                    }),
+                    window,
+                    cx,
+                );
+                if let Some(edited) = edited {
+                    panel.update(cx, |panel, cx| {
+                        panel
+                            .commit_message_buffer(cx)
+                            .update(cx, |buffer, cx| buffer.set_text(edited, cx));
+                    });
+                }
+                panel
+            });
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.reopen_commit_buffer(window, cx);
+                panel.reopen_commit_buffer(window, cx);
+                assert_eq!(
+                    panel.commit_message_buffer(cx).read(cx).text(),
+                    edited.unwrap_or("saved")
+                );
+                assert_eq!(
+                    panel.serialized_commit_messages(cx)[path!("/project")]
+                        .message
+                        .as_deref(),
+                    Some(edited.unwrap_or("saved"))
+                );
+            });
+            cx.simulate_prompt_answer(answer);
+            cx.run_until_parked();
+            assert!(!cx.has_pending_prompt());
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.reopen_commit_buffer(window, cx)
+            });
+            cx.run_until_parked();
+            assert!(!cx.has_pending_prompt());
+            panel.read_with(&cx, |panel, cx| {
+                assert_eq!(
+                    panel.commit_message_buffer(cx).read(cx).text(),
+                    expected_local
+                );
+                assert_eq!(repository_buffer.read(cx).text(), expected_repository);
+            });
+            workspace
+                .update(&mut cx, |workspace, cx| {
+                    panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+                })
+                .await
+                .expect("draft should flush");
+            let key = workspace.read_with(&cx, |workspace, _| {
+                GitPanel::serialization_key(workspace)
+                    .expect("workspace should have a persistence key")
+            });
+            let kvp = cx.update(|_, cx| KeyValueStore::global(cx));
+            let serialized = cx
+                .background_spawn(async move { kvp.read_kvp(&key) })
+                .await
+                .expect("panel state should be readable")
+                .expect("panel state should be saved");
+            let serialized = serde_json::from_str::<SerializedGitPanel>(&serialized)
+                .expect("panel state should deserialize");
+            assert_eq!(
+                serialized
+                    .commit_messages
+                    .get(path!("/project"))
+                    .and_then(|message| message.message.as_deref()),
+                Some(expected_local),
+            );
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.items_of_type::<Editor>(cx).count(), 0)
+            });
+            drop(panel);
+            if !resolved {
+                let restored_panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+                    GitPanel::new_with_serialized_panel(
+                        workspace,
+                        Some(serialized.clone()),
+                        window,
+                        cx,
+                    )
+                });
+                cx.run_until_parked();
+                assert!(cx.has_pending_prompt());
+                cx.simulate_prompt_answer("Cancel");
+                cx.run_until_parked();
+                restored_panel.read_with(&cx, |panel, cx| {
+                    assert_eq!(
+                        panel.commit_message_buffer(cx).read(cx).text(),
+                        expected_local
+                    );
+                    assert_eq!(repository_buffer.read(cx).text(), "independent");
+                    assert_eq!(
+                        serde_json::to_value(panel.serialized_state(cx))
+                            .expect("panel should serialize"),
+                        serde_json::to_value(&serialized).expect("saved panel should serialize")
+                    );
+                });
+                drop(restored_panel);
+                let rootless_project = Project::test(fs, [], &mut cx).await;
+                let rootless_window = cx.add_window(|window, cx| {
+                    MultiWorkspace::test_new(rootless_project, window, cx)
+                });
+                let rootless_workspace = rootless_window
+                    .read_with(&cx, |workspace, _| workspace.workspace().clone())
+                    .expect("workspace should exist");
+                let mut rootless_cx = VisualTestContext::from_window(rootless_window.into(), &cx);
+                let rootless_panel =
+                    rootless_workspace.update_in(&mut rootless_cx, |workspace, window, cx| {
+                        GitPanel::new_with_serialized_panel(
+                            workspace,
+                            Some(serialized.clone()),
+                            window,
+                            cx,
+                        )
+                    });
+                rootless_cx.run_until_parked();
+                assert!(!rootless_cx.has_pending_prompt());
+                rootless_panel.read_with(&rootless_cx, |panel, cx| {
+                    assert_eq!(
+                        serde_json::to_value(panel.serialized_state(cx))
+                            .expect("panel should serialize"),
+                        serde_json::to_value(&serialized).expect("saved panel should serialize")
+                    );
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_commit_draft_prompt_revalidates_buffers_and_owner(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project-a": {".git": {}, "file": "a"},
+                "project-b": {".git": {}, "file": "b"},
+            }),
+        )
+        .await;
+        let project = Project::test(
+            fs,
+            [
+                Path::new(path!("/root/project-a")),
+                Path::new(path!("/root/project-b")),
+            ],
+            cx,
+        )
+        .await;
+        let (repository_a, repository_b) = project.read_with(cx, |project, cx| {
+            let repositories = project.git_store().read(cx).repositories();
+            let find = |path: &Path| {
+                repositories
+                    .values()
+                    .find(|repository| repository.read(cx).work_directory_abs_path.as_ref() == path)
+                    .expect("repository should exist")
+                    .clone()
+            };
+            (
+                find(Path::new(path!("/root/project-a"))),
+                find(Path::new(path!("/root/project-b"))),
+            )
+        });
+        repository_a.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .expect("workspace should exist");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        register_git_commit_language(&project, cx);
+        let repository_buffer = repository_a
+            .update(cx, |repository, cx| {
+                let project = project.read(cx);
+                repository.open_commit_buffer(
+                    Some(project.languages().clone()),
+                    project.buffer_store().clone(),
+                    cx,
+                )
+            })
+            .await
+            .expect("commit buffer should load");
+        repository_buffer.update(cx, |buffer, cx| buffer.set_text("independent", cx));
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            GitPanel::new_with_serialized_panel(
+                workspace,
+                Some(SerializedGitPanel {
+                    commit_messages: BTreeMap::from_iter([(
+                        path!("/root/project-a").to_string(),
+                        SerializedCommitMessage {
+                            message: Some("saved".to_string()),
+                            ..SerializedCommitMessage::default()
+                        },
+                    )]),
+                    ..SerializedGitPanel::default()
+                }),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        repository_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("changed while prompting", cx)
+        });
+        cx.simulate_prompt_answer("Use Restored Draft");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "saved");
+            assert_eq!(repository_buffer.read(cx).text(), "changed while prompting");
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.focus_editor(&FocusEditor, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        panel.update(cx, |panel, cx| {
+            panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                buffer.set_text("typed while prompting", cx)
+            });
+        });
+        cx.simulate_prompt_answer("Keep Repository Draft");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.commit_message_buffer(cx).read(cx).text(),
+                "typed while prompting"
+            );
+            assert_eq!(repository_buffer.read(cx).text(), "changed while prompting");
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.focus_editor(&FocusEditor, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "");
+            assert!(repository_b.read(cx).commit_message_buffer().is_none());
+            assert!(panel.has_current_commit_buffer(cx));
+        });
+        cx.simulate_prompt_answer("Use Edited Draft");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_repository.as_ref(), Some(&repository_b));
+            assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "");
+            assert_eq!(repository_buffer.read(cx).text(), "changed while prompting");
+            assert_eq!(
+                panel.serialized_commit_messages(cx)[path!("/root/project-a")]
+                    .message
+                    .as_deref(),
+                Some("typed while prompting")
+            );
+        });
+        repository_a.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        cx.run_until_parked();
+        repository_a.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.reopen_commit_buffer(window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.commit_message_buffer(cx).read(cx).text(),
+                "typed while prompting"
+            );
+            assert_eq!(repository_buffer.read(cx).text(), "changed while prompting");
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            let source = panel.commit_message_buffer(cx);
+            assert!(
+                panel
+                    .serialized_commit_messages(cx)
+                    .get(path!("/root/project-b"))
+                    .is_none()
+            );
+            repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+            panel.schedule_update(window, cx);
+            assert_eq!(panel.active_repository.as_ref(), Some(&repository_b));
+            assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "");
+            panel.set_commit_buffer(source, window, cx);
+            assert_eq!(
+                panel.configure_commit_button(cx),
+                (false, "Loading commit message...")
+            );
+            assert!(!panel.commit_changes(panel.commit_options(), window, cx));
+            assert!(panel.pending_commit.is_none());
+            assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), "");
+        });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        project.update(cx, |project, cx| {
+            for path in [path!("/root/project-a"), path!("/root/project-b")] {
+                project.remove_worktree_for_main_worktree_path(path, cx);
+            }
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(panel.active_repository.is_none());
+            assert_eq!(
+                panel.serialized_commit_messages(cx)[path!("/root/project-a")]
+                    .message
+                    .as_deref(),
+                Some("typed while prompting")
+            );
+        });
+        let (worktree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/root/project-a"), true, cx)
+            })
+            .await
+            .expect("worktree should reopen");
+        worktree
+            .read_with(cx, |worktree, _| {
+                worktree
+                    .as_local()
+                    .expect("worktree should be local")
+                    .scan_complete()
+            })
+            .await;
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        panel.read_with(cx, |panel, cx| {
+            let repository = panel
+                .active_repository
+                .as_ref()
+                .expect("repository should exist");
+            assert_ne!(repository, &repository_a);
+            assert_eq!(
+                repository.read(cx).commit_message_buffer(),
+                Some(&panel.commit_message_buffer(cx))
+            );
+            assert_eq!(
+                panel.commit_message_buffer(cx).read(cx).text(),
+                "typed while prompting"
+            );
+            assert!(panel.pending_commit_buffers.is_empty());
+            assert_eq!(
+                panel.serialized_commit_messages(cx)[path!("/root/project-a")]
+                    .message
+                    .as_deref(),
+                Some("typed while prompting")
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_pending_commit_state_is_per_repository(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.background_executor.clone());
@@ -13084,8 +14534,24 @@ mod tests {
         let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
 
         register_git_commit_language(&project, cx);
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
         let panel = workspace.update_in(cx, GitPanel::new);
         cx.run_until_parked();
+        panel.update(cx, |panel, _| {
+            panel.pending_commit_message_restores.insert(
+                path!("/root/project-b").to_string(),
+                SerializedCommitMessage {
+                    message: Some("Draft for B".to_string()),
+                    ..SerializedCommitMessage::default()
+                },
+            );
+        });
+        let (release_buffer, buffer_gate) = futures::channel::oneshot::channel::<()>();
+        let blocked_job = repository_b.update(cx, |repository, _| {
+            repository.send_job("block commit buffer", None, |_, _| async move {
+                buffer_gate.await.expect("buffer gate should be released");
+            })
+        });
 
         // Enter an amend on repository A, then simulate the amend flow loading
         // the last commit message into the editor.
@@ -13120,6 +14586,50 @@ mod tests {
             assert!(serialized.values().all(|message| !message.amend_pending));
         });
 
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_repository.as_ref(), Some(&repository_b));
+            assert_eq!(
+                panel.commit_message_buffer(cx).read(cx).text(),
+                "Draft for B"
+            );
+            assert!(repository_b.read(cx).commit_message_buffer().is_none());
+        });
+        workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .expect("panel flush should succeed");
+        let key = workspace.read_with(cx, |workspace, _| {
+            GitPanel::serialization_key(workspace).expect("workspace should have a persistence key")
+        });
+        let kvp = cx.update(|_, cx| KeyValueStore::global(cx));
+        let serialized = cx
+            .background_spawn(async move { kvp.read_kvp(&key) })
+            .await
+            .expect("panel state should be readable")
+            .expect("panel state should be saved");
+        let serialized = serde_json::from_str::<serde_json::Value>(&serialized)
+            .expect("panel state should be valid JSON");
+        assert_eq!(
+            serialized["commit_messages"],
+            json!({
+                (path!("/root/project-a")): {"message": "Draft for A", "amend_pending": false},
+                (path!("/root/project-b")): {"message": "Draft for B", "amend_pending": false},
+            })
+        );
+        release_buffer
+            .send(())
+            .expect("buffer should still be loading");
+        blocked_job.await.expect("blocked job should finish");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.commit_message_buffer(cx).read(cx).text(),
+                "Draft for B"
+            );
+        });
+
         // Repository A's pre-amend draft is restored, discarding the amend edit.
         let buffer_a = repository_a.read_with(cx, |repository, _| {
             repository
@@ -13129,6 +14639,50 @@ mod tests {
         });
         buffer_a.read_with(cx, |buffer, _| {
             assert_eq!(buffer.text(), "Draft for A");
+        });
+
+        for repository in [&repository_a, &repository_b] {
+            let buffer = repository.read_with(cx, |repository, _| {
+                repository
+                    .commit_message_buffer()
+                    .expect("buffer should be open")
+                    .clone()
+            });
+            buffer.update(cx, |buffer, cx| buffer.set_text("", cx));
+        }
+        workspace.update_in(cx, |workspace, window, cx| {
+            let restored_panel = GitPanel::new_with_serialized_panel(
+                workspace,
+                Some(
+                    serde_json::from_value(serialized.clone())
+                        .expect("panel state should deserialize"),
+                ),
+                window,
+                cx,
+            );
+            assert_eq!(
+                serde_json::to_value(restored_panel.read(cx).serialized_commit_messages(cx))
+                    .expect("drafts should serialize"),
+                serialized["commit_messages"]
+            );
+            let buffer_b = repository_b
+                .read(cx)
+                .commit_message_buffer()
+                .expect("buffer should be open")
+                .clone();
+            for (live_message, expected_message) in [
+                (" \t\n", "Draft for B"),
+                ("Updated draft for B", "Draft for B"),
+            ] {
+                buffer_b.update(cx, |buffer, cx| buffer.set_text(live_message, cx));
+                let mut expected_messages = serialized["commit_messages"].clone();
+                expected_messages[path!("/root/project-b")]["message"] = json!(expected_message);
+                assert_eq!(
+                    serde_json::to_value(restored_panel.read(cx).serialized_commit_messages(cx))
+                        .expect("drafts should serialize"),
+                    expected_messages
+                );
+            }
         });
     }
 
@@ -16236,5 +17790,34 @@ mod tests {
                 "marks must not carry over to another repository",
             );
         });
+    }
+
+    async fn init_persistent_git_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<MultiWorkspace>,
+        Entity<Workspace>,
+        Entity<GitPanel>,
+    ) {
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({"project": {".git": {}, "file.txt": "a"}}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/root/project"))], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("window should exist");
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        register_git_commit_language(&project, cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+        (window, workspace, panel)
     }
 }
