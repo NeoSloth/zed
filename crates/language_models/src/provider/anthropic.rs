@@ -338,6 +338,17 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| {
+            if state.is_authenticated()
+                && state.fetch_models_task.as_ref().is_none_or(Task::is_ready)
+            {
+                state.restart_fetch_models_task(cx);
+            }
+        });
+        Task::ready(Ok(()))
+    }
+
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.read(cx);
         Some(ProviderSettingsView::ApiKey(ApiKeyConfiguration::new(
@@ -606,6 +617,28 @@ mod tests {
     use language_model::{LanguageModelRequestMessage, MessageContent};
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[gpui::test]
+    async fn test_registry_refreshes_catalog_without_reloading_credentials(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::provider::tests::assert_catalog_refresh(
+            cx,
+            |http_client, credentials, cx| {
+                let provider = AnthropicLanguageModelProvider::new(http_client, credentials, cx);
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        AnthropicLanguageModelProvider::api_url(cx),
+                        EnvVar { name: "TEST_API_KEY".into(), value: None },
+                    );
+                });
+                provider
+            },
+            r#"{"data":[{"id":"catalog-model","display_name":"Catalog Model","max_input_tokens":10000,"max_tokens":1000}]}"#,
+            |provider, cx| provider.state.read(cx).fetched_models.iter().map(|model| model.id.clone()).collect(),
+            &["catalog-model"],
+        ).await;
+    }
 
     fn parse_available_model(json: &str) -> AvailableModel {
         serde_json::from_str(json).expect("test fixture should parse")

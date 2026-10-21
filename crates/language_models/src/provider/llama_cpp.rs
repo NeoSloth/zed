@@ -2,7 +2,7 @@ use anyhow::Result;
 use collections::{HashMap, HashSet};
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt, channel::oneshot, future::BoxFuture};
 use gpui::{App, AsyncApp, Context, Entity, Task, TaskExt};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
@@ -88,10 +88,11 @@ impl State {
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.fetch_model_task = None;
         let credentials_provider = self.credentials_provider.clone();
         let api_url = LlamaCppLanguageModelProvider::api_url(cx);
         let task = self.api_key_state.store(
-            api_url,
+            api_url.clone(),
             api_key,
             |this| &mut this.api_key_state,
             credentials_provider,
@@ -103,36 +104,51 @@ impl State {
         // below restarts it).
         self.model_event_task = None;
         write_recover(&self.loading_progress).clear();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |state, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
+            state
+                .update(cx, |state, cx| {
+                    if LlamaCppLanguageModelProvider::api_url(cx) == api_url {
+                        state.restart_fetch_models_task(cx);
+                    }
+                })
                 .ok();
             result
         })
     }
 
-    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+    fn authenticate(
+        &mut self,
+        retry_credentials: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), AuthenticateError>> {
+        self.fetch_model_task = None;
         let credentials_provider = self.credentials_provider.clone();
         let api_url = LlamaCppLanguageModelProvider::api_url(cx);
-        let load_key_task = self.api_key_state.load_if_needed(
-            api_url,
-            |this| &mut this.api_key_state,
-            credentials_provider,
-            cx,
-        );
+        let load_key_task = if retry_credentials {
+            self.api_key_state.load_if_needed(
+                api_url,
+                |state| &mut state.api_key_state,
+                credentials_provider,
+                cx,
+            )
+        } else {
+            self.api_key_state.load_cached(
+                api_url,
+                |state| &mut state.api_key_state,
+                credentials_provider,
+                cx,
+            )
+        };
 
-        if self.is_authenticated() {
-            return Task::ready(Ok(()));
-        }
-
-        cx.spawn(async move |this, cx| {
+        let authenticate = async move |state: gpui::WeakEntity<Self>, cx: &mut AsyncApp| {
             match load_key_task.await {
                 Ok(()) | Err(AuthenticateError::CredentialsNotFound) => {}
                 Err(error) => {
                     log::warn!("failed to load llama.cpp API key: {error}");
                 }
             }
-            let fetch_models_task = this.update(cx, |this, cx| this.fetch_models(cx))?;
+            let fetch_models_task = state.update(cx, |state, cx| state.fetch_models(cx))?;
             match fetch_models_task.await {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -151,7 +167,17 @@ impl State {
                     }
                 }
             }
-        })
+        };
+        let (mut sender, receiver) = oneshot::channel();
+        self.fetch_model_task = Some(cx.spawn(async move |state, cx| {
+            let result = futures::select_biased! {
+                _ = sender.cancellation().fuse() => return Ok(()),
+                result = authenticate(state, cx).fuse() => result,
+            };
+            sender.send(result).ok();
+            Ok(())
+        }));
+        cx.background_spawn(async move { receiver.await.unwrap_or(Ok(())) })
     }
 
     fn fetch_models(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -161,7 +187,7 @@ impl State {
         let api_key = self.api_key_state.key(&api_url);
         let extra_headers = settings.custom_headers.clone();
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |state, cx| {
             let entries = get_models(
                 http_client.as_ref(),
                 &api_url,
@@ -228,7 +254,7 @@ impl State {
                     .collect()
             };
 
-            this.update(cx, |this, cx| {
+            state.update(cx, |this, cx| {
                 this.fetched_models = models;
                 let effective = compute_effective_models(
                     &this.fetched_models,
@@ -335,7 +361,7 @@ impl State {
 
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
         let task = self.fetch_models(cx);
-        self.fetch_model_task.replace(task);
+        self.fetch_model_task = Some(task);
     }
 }
 
@@ -486,7 +512,7 @@ impl LlamaCppLanguageModelProvider {
                                 // the new URL (re-auth below restarts it).
                                 this.model_event_task = None;
                                 write_recover(&this.loading_progress).clear();
-                                this.authenticate(cx).detach();
+                                this.authenticate(true, cx).detach();
                             }
                             cx.notify();
                         }
@@ -677,7 +703,13 @@ impl LanguageModelProvider for LlamaCppLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        self.state
+            .update(cx, |state, cx| state.authenticate(true, cx))
+    }
+
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state
+            .update(cx, |state, cx| state.authenticate(false, cx))
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -1868,6 +1900,40 @@ mod tests {
             cx.update(|cx| provider.config(&selected, cx)),
             Err(LanguageModelCompletionError::ModelUnavailable { .. })
         ));
+    }
+
+    #[gpui::test]
+    async fn test_registry_discovery_recovery(cx: &mut TestAppContext) {
+        crate::provider::ollama::tests::assert_registry_discovery_recovery(
+            |http_client, credentials, cx| {
+                let provider = LlamaCppLanguageModelProvider::new(http_client, credentials, cx);
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        LlamaCppLanguageModelProvider::api_url(cx),
+                        EnvVar {
+                            name: SharedString::new_static("TEST_API_KEY"),
+                            value: None,
+                        },
+                    );
+                });
+                provider
+            },
+            |provider, key, cx| {
+                provider
+                    .state
+                    .update(cx, |state, cx| state.set_api_key(key, cx))
+            },
+            &[
+                (
+                    "/v1/models",
+                    r#"{"data":[{"id":"test-model","meta":{"n_ctx":4096}}]}"#,
+                ),
+                ("/props", "{}"),
+            ],
+            true,
+            cx,
+        )
+        .await;
     }
 
     #[gpui::test]

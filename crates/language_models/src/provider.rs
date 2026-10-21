@@ -72,8 +72,21 @@ pub(crate) fn resolve_custom_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{StreamExt, stream};
-    use language_model::stream_in_background;
+    use anyhow::{Result, anyhow};
+    use credentials_provider::CredentialsProvider;
+    use futures::{StreamExt, channel::oneshot, future::LocalBoxFuture, stream};
+    use gpui::{App, AppContext, AsyncApp, BorrowAppContext, Entity, TestAppContext};
+    use http_client::{AsyncBody, FakeHttpClient, HttpClient, Response};
+    use language_model::{
+        LanguageModelProvider, LanguageModelProviderState, LanguageModelRegistry,
+        stream_in_background,
+    };
+    use parking_lot::Mutex;
+    use settings::SettingsStore;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[gpui::test]
     async fn test_stream_in_background(cx: &mut gpui::TestAppContext) {
@@ -85,22 +98,6 @@ mod tests {
             .await;
 
         assert_eq!(mapped_events, [1, 10, 2, 20, 3, 30]);
-    }
-
-    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    }
-
-    fn names(headers: &CustomHeaders) -> Vec<String> {
-        let mut names: Vec<String> = headers
-            .iter()
-            .map(|(name, _)| name.as_str().to_owned())
-            .collect();
-        names.sort();
-        names
     }
 
     #[test]
@@ -150,5 +147,223 @@ mod tests {
         ]);
         let merged = resolve_custom_headers("Test", &settings, &[]);
         assert_eq!(names(&merged), vec!["x-allowed".to_string()]);
+    }
+
+    pub(super) async fn assert_catalog_refresh<
+        P: LanguageModelProvider + LanguageModelProviderState,
+    >(
+        cx: &mut TestAppContext,
+        new_provider: impl Fn(Arc<dyn HttpClient>, Arc<dyn CredentialsProvider>, &mut App) -> P,
+        catalog: &'static str,
+        fetched_models: impl Fn(&P, &App) -> Vec<String>,
+        expected_models: &[&str],
+    ) {
+        for (key, fail_reads) in [(Some("secret"), false), (None, false), (None, true)] {
+            let credentials = Arc::new(TestCredentials {
+                key: Mutex::new(key.map(|key| key.as_bytes().to_vec())),
+                fail_reads,
+                ..TestCredentials::default()
+            });
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let http_client = FakeHttpClient::create({
+                let requests = requests.clone();
+                move |_| {
+                    let (sender, receiver) = oneshot::channel::<(u16, &'static str)>();
+                    requests.lock().push(sender);
+                    async move {
+                        let (status, body) = receiver.await?;
+                        Ok(Response::builder()
+                            .status(status)
+                            .body(AsyncBody::from(body))?)
+                    }
+                }
+            });
+            let (provider, registry) = cx.update(|cx| {
+                test_settings(true, cx);
+                let provider = Arc::new(new_provider(http_client, credentials.clone(), cx));
+                let registry = register_provider(provider.clone(), cx);
+                (provider, registry)
+            });
+            cx.run_until_parked();
+            refresh_registry(&registry, cx);
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(requests.lock().len(), 0);
+
+            cx.update(|cx| set_disabled_ai(false, cx));
+            cx.run_until_parked();
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            let has_key = key.is_some();
+            for _ in 0..3 {
+                refresh_registry(&registry, cx);
+            }
+            assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(requests.lock().len(), usize::from(has_key));
+            assert_eq!(
+                cx.read(|cx| fetched_models(&provider, cx)),
+                Vec::<String>::new()
+            );
+
+            if has_key {
+                requests
+                    .lock()
+                    .pop()
+                    .expect("initial request")
+                    .send((503, "offline"))
+                    .expect("initial request was not cancelled");
+                cx.run_until_parked();
+                assert_eq!(
+                    cx.read(|cx| fetched_models(&provider, cx)),
+                    Vec::<String>::new()
+                );
+
+                cx.update(|cx| set_disabled_ai(true, cx));
+                cx.run_until_parked();
+                cx.update(|cx| set_disabled_ai(false, cx));
+                cx.run_until_parked();
+                refresh_registry(&registry, cx);
+                assert_eq!(
+                    requests.lock().len(),
+                    1,
+                    "reload must retry the failed catalog"
+                );
+                for _ in 0..3 {
+                    refresh_registry(&registry, cx);
+                }
+                assert_eq!(requests.lock().len(), 1);
+                requests
+                    .lock()
+                    .pop()
+                    .expect("retry request")
+                    .send((200, catalog))
+                    .expect("retry request was not cancelled");
+                cx.run_until_parked();
+                let mut models = cx.read(|cx| fetched_models(&provider, cx));
+                models.sort();
+                assert_eq!(models, expected_models);
+                assert_eq!(credentials.reads.load(Ordering::SeqCst), 1);
+            } else {
+                cx.update(|cx| provider.authenticate(cx)).await.ok();
+                cx.run_until_parked();
+                assert_eq!(credentials.reads.load(Ordering::SeqCst), 2);
+                assert_eq!(requests.lock().len(), 0);
+            }
+            drop(registry);
+            drop(provider);
+            cx.run_until_parked();
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct TestCredentials {
+        pub(super) reads: AtomicUsize,
+        pub(super) key: Mutex<Option<Vec<u8>>>,
+        pub(super) pending_read: Mutex<Option<oneshot::Receiver<()>>>,
+        pub(super) pending_write: Mutex<Option<oneshot::Receiver<()>>>,
+        fail_reads: bool,
+    }
+
+    pub(super) fn defer(slot: &Mutex<Option<oneshot::Receiver<()>>>) -> oneshot::Sender<()> {
+        let (sender, receiver) = oneshot::channel();
+        *slot.lock() = Some(receiver);
+        sender
+    }
+
+    pub(super) fn test_settings(disabled: bool, cx: &mut App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        set_disabled_ai(disabled, cx);
+    }
+
+    pub(super) fn register_provider<P: LanguageModelProvider + LanguageModelProviderState>(
+        provider: Arc<P>,
+        cx: &mut App,
+    ) -> Entity<LanguageModelRegistry> {
+        cx.new(|cx| {
+            let mut registry = LanguageModelRegistry::default();
+            registry.register_provider(provider, cx);
+            registry.authenticate_providers(cx);
+            registry
+        })
+    }
+
+    pub(super) fn refresh_registry(
+        registry: &Entity<LanguageModelRegistry>,
+        cx: &mut TestAppContext,
+    ) {
+        registry.update(cx, |registry, cx| registry.authenticate_providers(cx));
+        cx.run_until_parked();
+    }
+
+    pub(super) fn set_disabled_ai(disabled: bool, cx: &mut App) {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.disable_ai = Some(disabled.into());
+            });
+        });
+    }
+
+    impl CredentialsProvider for TestCredentials {
+        fn read_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<Option<(String, Vec<u8>)>>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let wait = self.pending_read.lock().take();
+            let key = self.key.lock().clone();
+            Box::pin(async move {
+                if let Some(wait) = wait {
+                    wait.await?;
+                }
+                if self.fail_reads {
+                    return Err(anyhow!("credential read failed"));
+                }
+                Ok(key.map(|key| ("Bearer".to_string(), key)))
+            })
+        }
+
+        fn write_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _username: &'a str,
+            password: &'a [u8],
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<()>> {
+            let wait = self.pending_write.lock().take();
+            Box::pin(async move {
+                if let Some(wait) = wait {
+                    wait.await?;
+                }
+                *self.key.lock() = Some(password.to_vec());
+                Ok(())
+            })
+        }
+
+        fn delete_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                *self.key.lock() = None;
+                Ok(())
+            })
+        }
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn names(headers: &CustomHeaders) -> Vec<String> {
+        let mut names: Vec<String> = headers
+            .iter()
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect();
+        names.sort();
+        names
     }
 }

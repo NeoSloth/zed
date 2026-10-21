@@ -337,6 +337,17 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| {
+            if state.is_authenticated()
+                && state.fetch_models_task.as_ref().is_none_or(Task::is_ready)
+            {
+                state.restart_fetch_models_task(cx);
+            }
+        });
+        Task::ready(Ok(()))
+    }
+
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.read(cx);
         Some(ProviderSettingsView::ApiKey(ApiKeyConfiguration::new(
@@ -750,6 +761,28 @@ fn add_message_content_part(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn test_registry_refreshes_catalog_without_reloading_credentials(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::provider::tests::assert_catalog_refresh(
+            cx,
+            |http_client, credentials, cx| {
+                let provider = OpenRouterLanguageModelProvider::new(http_client, credentials, cx);
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        OpenRouterLanguageModelProvider::api_url(cx),
+                        EnvVar { name: "TEST_API_KEY".into(), value: None },
+                    );
+                });
+                provider
+            },
+            r#"{"data":[{"id":"catalog-model","name":"Catalog Model","created":0,"description":"Test","context_length":10000}]}"#,
+            |provider, cx| provider.state.read(cx).available_models.iter().map(|model| model.name.clone()).collect(),
+            &["catalog-model"],
+        ).await;
+    }
 
     #[gpui::test]
     async fn test_session_id_is_stable_without_exposing_thread_id() {

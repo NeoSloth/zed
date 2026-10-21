@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt, channel::oneshot, future::BoxFuture};
 use gpui::{App, AsyncApp, Context, Entity, Subscription, Task, TaskExt};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
@@ -65,17 +65,27 @@ impl State {
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.fetch_model_task = None;
         let credentials_provider = self.credentials_provider.clone();
-        let api_url = LmStudioLanguageModelProvider::api_url(cx).into();
+        let api_url = LmStudioLanguageModelProvider::api_url(cx);
         let task = self.api_key_state.store(
-            api_url,
+            SharedString::from(api_url.clone()),
             api_key,
             |this| &mut this.api_key_state,
             credentials_provider,
             cx,
         );
-        self.restart_fetch_models_task(cx);
-        task
+        cx.spawn(async move |state, cx| {
+            let result = task.await;
+            state
+                .update(cx, |state, cx| {
+                    if LmStudioLanguageModelProvider::api_url(cx) == api_url {
+                        state.restart_fetch_models_task(cx);
+                    }
+                })
+                .ok();
+            result
+        })
     }
 
     fn fetch_models(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -86,7 +96,7 @@ impl State {
         let extra_headers = settings.custom_headers.clone();
 
         // As a proxy for the server being "authenticated", we'll check if its up by fetching the models
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |state, cx| {
             let models = get_models(
                 http_client.as_ref(),
                 &api_url,
@@ -114,8 +124,8 @@ impl State {
 
             models.sort_by(|a, b| a.name.cmp(&b.name));
 
-            this.update(cx, |this, cx| {
-                this.available_models = models;
+            state.update(cx, |state, cx| {
+                state.available_models = models;
                 cx.notify();
             })
         })
@@ -123,25 +133,41 @@ impl State {
 
     fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
         let task = self.fetch_models(cx);
-        self.fetch_model_task.replace(task);
+        self.fetch_model_task = Some(task);
     }
 
-    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+    fn authenticate(
+        &mut self,
+        retry_credentials: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), AuthenticateError>> {
+        self.fetch_model_task = None;
         let credentials_provider = self.credentials_provider.clone();
         let api_url = LmStudioLanguageModelProvider::api_url(cx).into();
-        let _task = self.api_key_state.load_if_needed(
-            api_url,
-            |this| &mut this.api_key_state,
-            credentials_provider,
-            cx,
-        );
+        let load_key_task = if retry_credentials {
+            self.api_key_state.load_if_needed(
+                api_url,
+                |state| &mut state.api_key_state,
+                credentials_provider,
+                cx,
+            )
+        } else {
+            self.api_key_state.load_cached(
+                api_url,
+                |state| &mut state.api_key_state,
+                credentials_provider,
+                cx,
+            )
+        };
 
-        if self.is_authenticated() {
-            return Task::ready(Ok(()));
-        }
-
-        let fetch_models_task = self.fetch_models(cx);
-        cx.spawn(async move |_this, _cx| {
+        let authenticate = async move |state: gpui::WeakEntity<Self>, cx: &mut AsyncApp| {
+            match load_key_task.await {
+                Ok(()) | Err(AuthenticateError::CredentialsNotFound) => {}
+                Err(error) => {
+                    log::warn!("failed to load LM Studio API key: {error}");
+                }
+            }
+            let fetch_models_task = state.update(cx, |state, cx| state.fetch_models(cx))?;
             match fetch_models_task.await {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -164,7 +190,17 @@ impl State {
                     }
                 }
             }
-        })
+        };
+        let (mut sender, receiver) = oneshot::channel();
+        self.fetch_model_task = Some(cx.spawn(async move |state, cx| {
+            let result = futures::select_biased! {
+                _ = sender.cancellation().fuse() => return Ok(()),
+                result = authenticate(state, cx).fuse() => result,
+            };
+            sender.send(result).ok();
+            Ok(())
+        }));
+        cx.background_spawn(async move { receiver.await.unwrap_or(Ok(())) })
     }
 }
 
@@ -183,6 +219,9 @@ impl LmStudioLanguageModelProvider {
                         let new_settings =
                             AllLanguageModelSettings::get_global(cx).lmstudio.clone();
                         if settings != new_settings {
+                            if settings.api_url != new_settings.api_url {
+                                this.available_models.clear();
+                            }
                             let credentials_provider = this.credentials_provider.clone();
                             let api_url = Self::api_url(cx).into();
                             this.api_key_state.handle_url_change(
@@ -192,7 +231,7 @@ impl LmStudioLanguageModelProvider {
                                 cx,
                             );
                             settings = new_settings;
-                            this.restart_fetch_models_task(cx);
+                            this.authenticate(false, cx).detach();
                             cx.notify();
                         }
                     }
@@ -314,7 +353,13 @@ impl LanguageModelProvider for LmStudioLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        self.state
+            .update(cx, |state, cx| state.authenticate(true, cx))
+    }
+
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state
+            .update(cx, |state, cx| state.authenticate(false, cx))
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -760,6 +805,36 @@ impl ConfigurationView {
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn test_registry_discovery_recovery(cx: &mut TestAppContext) {
+        crate::provider::ollama::tests::assert_registry_discovery_recovery(
+            |http_client, credentials, cx| {
+                let provider = LmStudioLanguageModelProvider::new(http_client, credentials, cx);
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        SharedString::from(LmStudioLanguageModelProvider::api_url(cx)),
+                        EnvVar {
+                            name: SharedString::new_static("TEST_API_KEY"),
+                            value: None,
+                        },
+                    );
+                });
+                provider
+            },
+            |provider, key, cx| provider.state.update(cx, |state, cx| state.set_api_key(key, cx)),
+            &[("/api/v0/models", r#"{"data":[{"id":"test-model","object":"model","type":"llm","publisher":"test","compatibility_type":"gguf","state":"loaded","max_context_length":4096}]}"#)],
+            true,
+            cx,
+        )
+        .await;
     }
 }
 

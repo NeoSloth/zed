@@ -300,6 +300,17 @@ impl LanguageModelProvider for VercelAiGatewayLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| {
+            if state.is_authenticated()
+                && state.fetch_models_task.as_ref().is_none_or(Task::is_ready)
+            {
+                state.restart_fetch_models_task(cx);
+            }
+        });
+        Task::ready(Ok(()))
+    }
+
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.read(cx);
         Some(ProviderSettingsView::ApiKey(ApiKeyConfiguration::new(
@@ -579,4 +590,31 @@ async fn list_models(
     }
 
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn test_registry_refreshes_catalog_without_reloading_credentials(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::provider::tests::assert_catalog_refresh(
+            cx,
+            |http_client, credentials, cx| {
+                let provider = VercelAiGatewayLanguageModelProvider::new(http_client, credentials, cx);
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        VercelAiGatewayLanguageModelProvider::api_url(cx),
+                        EnvVar { name: "TEST_API_KEY".into(), value: None },
+                    );
+                });
+                provider
+            },
+            r#"{"data":[{"id":"catalog-model","name":"Catalog Model","context_window":10000,"max_tokens":1000}]}"#,
+            |provider, cx| provider.state.read(cx).available_models.iter().map(|model| model.name.clone()).collect(),
+            &["catalog-model"],
+        ).await;
+    }
 }

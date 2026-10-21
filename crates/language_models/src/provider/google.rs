@@ -336,6 +336,17 @@ impl LanguageModelProvider for GoogleLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| {
+            if state.is_authenticated()
+                && state.fetch_models_task.as_ref().is_none_or(Task::is_ready)
+            {
+                state.restart_fetch_models_task(cx);
+            }
+        });
+        Task::ready(Ok(()))
+    }
+
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.read(cx);
         Some(ProviderSettingsView::ApiKey(ApiKeyConfiguration::new(
@@ -435,5 +446,32 @@ fn available_model_to_google_model(available: &AvailableModel) -> google_ai::Mod
         mode: available.mode.unwrap_or_default(),
         supported_thinking_levels: Vec::new(),
         default_thinking_level: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn test_registry_refreshes_catalog_without_reloading_credentials(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::provider::tests::assert_catalog_refresh(
+            cx,
+            |http_client, credentials, cx| {
+                let provider = GoogleLanguageModelProvider::new(http_client, credentials, cx);
+                provider.state.update(cx, |state, cx| {
+                    state.api_key_state = ApiKeyState::new(
+                        GoogleLanguageModelProvider::api_url(cx),
+                        EnvVar { name: "TEST_API_KEY".into(), value: None },
+                    );
+                });
+                provider
+            },
+            r#"{"models":[{"name":"models/gemini-2.5-flash","displayName":"Gemini 2.5 Flash","inputTokenLimit":10000,"outputTokenLimit":1000,"supportedGenerationMethods":["generateContent"]}]}"#,
+            |provider, cx| provider.state.read(cx).fetched_models.iter().map(|model| model.id.clone()).collect(),
+            &["gemini-2.5-flash"],
+        ).await;
     }
 }

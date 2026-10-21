@@ -1,9 +1,11 @@
 use std::{
     cell::RefCell,
     env,
+    io::ErrorKind,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use std::{
@@ -11,7 +13,6 @@ use std::{
     fs::File,
     io::Read as _,
     os::fd::{AsFd, AsRawFd},
-    time::Duration,
 };
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -26,8 +27,9 @@ use ashpd::{
     enumflags2::BitFlags,
 };
 use calloop::{EventLoop, LoopHandle, LoopSignal, channel::Sender};
-use futures::channel::oneshot;
+use futures::{FutureExt as _, StreamExt as _, channel::oneshot, future::BoxFuture};
 use gpui_util::{ResultExt as _, new_std_command};
+use smol::lock::Mutex;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use xkbcommon::xkb::{self, Keycode, Keysym, State};
 
@@ -289,6 +291,7 @@ pub(crate) struct LinuxPlatform {
     /// A requested switch waiting for the event loop to apply it.
     pending_mode: RefCell<Option<WindowingRequest>>,
     transition_waiter: RefCell<Option<oneshot::Sender<anyhow::Result<()>>>>,
+    secret_service: Arc<Mutex<SecretServiceCache>>,
 }
 
 /// What a Wayland connection made at startup may use from this process's environment.
@@ -330,6 +333,7 @@ impl LinuxPlatform {
             startup_environment: RefCell::new(Some(startup)),
             pending_mode: RefCell::new(None),
             transition_waiter: RefCell::new(None),
+            secret_service: Arc::new(Mutex::new(SecretServiceCache::default())),
         }
     }
 
@@ -376,6 +380,71 @@ impl LinuxPlatform {
 
     fn with_common<R>(&self, function: impl FnOnce(&mut LinuxCommon) -> R) -> R {
         function(&mut self.common.borrow_mut())
+    }
+
+    fn with_keyring<R, F>(
+        &self,
+        read_only: bool,
+        operation: impl FnOnce(Arc<oo7::Keyring>) -> F + Clone + Send + 'static,
+    ) -> Task<Result<R>>
+    where
+        R: Send + 'static,
+        F: Future<Output = Result<R>> + Send,
+    {
+        let secret_service = self.secret_service.clone();
+        self.background_executor().spawn(async move {
+            if oo7::ashpd::is_sandboxed() {
+                let keyring = oo7::Keyring::new().await?;
+                keyring.unlock().await?;
+                return operation(Arc::new(keyring)).await;
+            }
+
+            let mut cache = secret_service.lock().await;
+            let mut retry_available = true;
+            loop {
+                let mut connection = None;
+                let mut retry_safe = true;
+                let operation = operation.clone();
+                let result = async {
+                    let connection = connection.insert(match cache.connected.take() {
+                        Some(connection) => connection,
+                        None => {
+                            let connection = cache
+                                .connecting
+                                .get_or_insert_with(|| SecretServiceKeyring::connect().boxed())
+                                .await;
+                            cache.connecting = None;
+                            connection?
+                        }
+                    });
+                    let SecretServiceKeyring {
+                        keyring,
+                        collection_path,
+                        bus,
+                        owner,
+                        disconnected,
+                    } = connection;
+                    await_secret_service(disconnected, async {
+                        SecretServiceKeyring::prepare(keyring, collection_path, bus, owner).await?;
+                        retry_safe = read_only;
+                        operation(keyring.clone()).await
+                    })
+                    .await
+                }
+                .await;
+                if let Err(error) = &result
+                    && classify_keyring_error(error) != KeyringErrorKind::Other
+                {
+                    if retry_available && retry_safe {
+                        retry_available = false;
+                        continue;
+                    }
+                    return result;
+                }
+                cache.connected = connection;
+                return result;
+            }
+        })
     }
 
     /// Connects to the display server `backend` in `environment`.
@@ -1029,9 +1098,7 @@ impl Platform for LinuxPlatform {
         let url = url.to_string();
         let username = username.to_string();
         let password = password.to_vec();
-        self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
-            keyring.unlock().await?;
+        self.with_keyring(false, |keyring| async move {
             keyring
                 .create_item(
                     KEYRING_LABEL,
@@ -1046,14 +1113,26 @@ impl Platform for LinuxPlatform {
 
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
         let url = url.to_string();
-        self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
-            keyring.unlock().await?;
-
+        self.with_keyring(true, |keyring| async move {
             let items = keyring.search_items(&vec![("url", &url)]).await?;
+            let mut label_error = None;
 
             for item in items.into_iter() {
-                if item.label().await.is_ok_and(|label| label == KEYRING_LABEL) {
+                let label = match item.label().await {
+                    Ok(label) => label,
+                    Err(error) => {
+                        let error = anyhow!(error);
+                        match classify_keyring_error(&error) {
+                            KeyringErrorKind::Connection => return Err(error),
+                            KeyringErrorKind::MissingObject => {}
+                            KeyringErrorKind::Other => {
+                                label_error.get_or_insert(error);
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if label == KEYRING_LABEL {
                     let attributes = item.attributes().await?;
                     let username = attributes
                         .get("username")
@@ -1068,26 +1147,38 @@ impl Platform for LinuxPlatform {
                     continue;
                 }
             }
-            Ok(None)
+            label_error.map_or(Ok(None), Err)
         })
     }
 
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         let url = url.to_string();
-        self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
-            keyring.unlock().await?;
-
+        self.with_keyring(false, |keyring| async move {
             let items = keyring.search_items(&vec![("url", &url)]).await?;
+            let mut label_error = None;
 
             for item in items.into_iter() {
-                if item.label().await.is_ok_and(|label| label == KEYRING_LABEL) {
+                let label = match item.label().await {
+                    Ok(label) => label,
+                    Err(error) => {
+                        let error = anyhow!(error);
+                        match classify_keyring_error(&error) {
+                            KeyringErrorKind::Connection => return Err(error),
+                            KeyringErrorKind::MissingObject => {}
+                            KeyringErrorKind::Other => {
+                                label_error.get_or_insert(error);
+                            }
+                        }
+                        continue;
+                    }
+                };
+                if label == KEYRING_LABEL {
                     item.delete().await?;
                     return Ok(());
                 }
             }
 
-            Ok(())
+            label_error.map_or(Ok(()), Err)
         })
     }
 
@@ -1698,10 +1789,1676 @@ async fn await_idle_sleep_prevention(
     }
 }
 
+const SECRET_SERVICE_NAME: oo7::zbus::names::WellKnownName<'static> =
+    oo7::zbus::names::WellKnownName::from_static_str_unchecked("org.freedesktop.secrets");
+
+#[derive(Default)]
+struct SecretServiceCache {
+    connecting: Option<BoxFuture<'static, Result<SecretServiceKeyring, oo7::dbus::Error>>>,
+    connected: Option<SecretServiceKeyring>,
+}
+
+struct SecretServiceKeyring {
+    keyring: Arc<oo7::Keyring>,
+    collection_path: oo7::zbus::zvariant::OwnedObjectPath,
+    bus: oo7::zbus::fdo::DBusProxy<'static>,
+    owner: oo7::zbus::names::OwnedUniqueName,
+    disconnected: BoxFuture<'static, oo7::dbus::Error>,
+}
+
+impl SecretServiceKeyring {
+    async fn prepare(
+        keyring: &oo7::Keyring,
+        expected_collection: &oo7::zbus::zvariant::OwnedObjectPath,
+        bus: &oo7::zbus::fdo::DBusProxy<'_>,
+        owner: &oo7::zbus::names::OwnedUniqueName,
+    ) -> oo7::Result<()> {
+        check_secret_service_owner(bus, owner).await?;
+        let collection_path = bus
+            .inner()
+            .connection()
+            .call_method(
+                Some(owner.as_str()),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "ReadAlias",
+                &"default",
+            )
+            .await
+            .map_err(oo7::dbus::ServiceError::from)
+            .map_err(oo7::dbus::Error::from)?
+            .body()
+            .deserialize::<oo7::zbus::zvariant::OwnedObjectPath>()
+            .map_err(oo7::dbus::Error::from)?;
+        if collection_path != *expected_collection {
+            return Err(oo7::dbus::Error::from(oo7::dbus::ServiceError::NoSession(
+                "Secret Service default collection changed".to_owned(),
+            ))
+            .into());
+        }
+        keyring.unlock().await?;
+        check_secret_service_owner(bus, owner).await?;
+        Ok(())
+    }
+
+    async fn connect() -> Result<Self, oo7::dbus::Error> {
+        let connection = oo7::zbus::connection::Builder::session()?
+            .method_timeout(Duration::from_secs(30))
+            .build()
+            .await?;
+        let bus = oo7::zbus::fdo::DBusProxy::new(&connection).await?;
+        let owner = match bus
+            .get_name_owner(oo7::zbus::names::BusName::WellKnown(SECRET_SERVICE_NAME))
+            .await
+        {
+            Err(oo7::zbus::fdo::Error::NameHasNoOwner(_)) => {
+                bus.start_service_by_name(SECRET_SERVICE_NAME, 0).await?;
+                bus.get_name_owner(oo7::zbus::names::BusName::WellKnown(SECRET_SERVICE_NAME))
+                    .await?
+            }
+            result => result?,
+        };
+        let service_name = SECRET_SERVICE_NAME;
+        let rule = oo7::zbus::MatchRule::builder()
+            .msg_type(oo7::zbus::message::Type::Signal)
+            .sender("org.freedesktop.DBus")?
+            .path("/org/freedesktop/DBus")?
+            .interface("org.freedesktop.DBus")?
+            .member("NameOwnerChanged")?
+            .add_arg(service_name.as_str())?
+            .add_arg(owner.as_str())?
+            .build();
+        let mut changes =
+            oo7::zbus::MessageStream::for_match_rule(rule, &connection, Some(1)).await?;
+        let mut disconnected = async move {
+            match changes.next().await {
+                Some(Ok(_)) => {
+                    oo7::dbus::ServiceError::NoSession("Secret Service owner changed".to_owned())
+                        .into()
+                }
+                Some(Err(error)) => oo7::dbus::ServiceError::NoSession(format!(
+                    "Secret Service owner monitor failed: {error}"
+                ))
+                .into(),
+                None => oo7::zbus::Error::from(std::io::Error::new(
+                    ErrorKind::NotConnected,
+                    "Secret Service owner monitor disconnected",
+                ))
+                .into(),
+            }
+        }
+        .boxed();
+        let collection = await_secret_service(&mut disconnected, async {
+            check_secret_service_owner(&bus, &owner).await?;
+            let service = oo7::dbus::Service::new().await?;
+            check_secret_service_owner(&bus, &owner).await?;
+            service.default_collection().await
+        })
+        .await?;
+        let collection_path = oo7::zbus::zvariant::OwnedObjectPath::from(collection.path().clone());
+        Ok(Self {
+            keyring: Arc::new(oo7::Keyring::DBus(collection)),
+            collection_path,
+            bus,
+            owner,
+            disconnected,
+        })
+    }
+}
+
+async fn await_secret_service<R, E>(
+    disconnected: &mut BoxFuture<'static, oo7::dbus::Error>,
+    operation: impl Future<Output = Result<R, E>>,
+) -> Result<R, E>
+where
+    E: From<oo7::dbus::Error>,
+{
+    futures::pin_mut!(operation);
+    match futures::future::select(disconnected, operation).await {
+        futures::future::Either::Left((error, _)) => Err(E::from(error)),
+        futures::future::Either::Right((result, _)) => result,
+    }
+}
+
+async fn check_secret_service_owner(
+    bus: &oo7::zbus::fdo::DBusProxy<'_>,
+    expected_owner: &oo7::zbus::names::OwnedUniqueName,
+) -> Result<(), oo7::dbus::Error> {
+    let owner = bus
+        .get_name_owner(oo7::zbus::names::BusName::WellKnown(SECRET_SERVICE_NAME))
+        .await?;
+    if owner != *expected_owner {
+        return Err(
+            oo7::dbus::ServiceError::NoSession("Secret Service owner changed".to_owned()).into(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyringErrorKind {
+    Connection,
+    MissingObject,
+    Other,
+}
+
+fn classify_keyring_error(error: &anyhow::Error) -> KeyringErrorKind {
+    let error = match error.downcast_ref::<oo7::Error>() {
+        Some(oo7::Error::DBus(error)) => Some(error),
+        _ => error.downcast_ref::<oo7::dbus::Error>(),
+    };
+    let mut error = match error {
+        Some(oo7::dbus::Error::Service(oo7::dbus::ServiceError::NoSession(_))) => {
+            return KeyringErrorKind::Connection;
+        }
+        Some(oo7::dbus::Error::ZBus(error))
+        | Some(oo7::dbus::Error::Service(oo7::dbus::ServiceError::ZBus(error))) => error,
+        _ => return KeyringErrorKind::Other,
+    };
+    let name = loop {
+        match error {
+            oo7::zbus::Error::InputOutput(error) => {
+                return match error.kind() {
+                    ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NotConnected
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::TimedOut => KeyringErrorKind::Connection,
+                    _ => KeyringErrorKind::Other,
+                };
+            }
+            oo7::zbus::Error::MethodError(name, ..) => break name.as_str(),
+            oo7::zbus::Error::FDO(inner) => match inner.as_ref() {
+                oo7::zbus::fdo::Error::ZBus(inner) => error = inner,
+                inner => {
+                    return match inner {
+                        oo7::zbus::fdo::Error::UnknownObject(_) => KeyringErrorKind::MissingObject,
+                        oo7::zbus::fdo::Error::NameHasNoOwner(_)
+                        | oo7::zbus::fdo::Error::ServiceUnknown(_)
+                        | oo7::zbus::fdo::Error::Disconnected(_)
+                        | oo7::zbus::fdo::Error::NoReply(_) => KeyringErrorKind::Connection,
+                        _ => KeyringErrorKind::Other,
+                    };
+                }
+            },
+            _ => return KeyringErrorKind::Other,
+        }
+    };
+    match name {
+        "org.freedesktop.DBus.Error.UnknownObject"
+        | "org.qtproject.QtDBus.Error.InvalidObjectPath" => KeyringErrorKind::MissingObject,
+        "org.freedesktop.DBus.Error.NameHasNoOwner"
+        | "org.freedesktop.DBus.Error.ServiceUnknown"
+        | "org.freedesktop.DBus.Error.Disconnected"
+        | "org.freedesktop.DBus.Error.NoReply" => KeyringErrorKind::Connection,
+        _ => KeyringErrorKind::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{Point, px};
+    use parking_lot::Mutex;
+
+    #[test]
+    fn test_keyring_connection_errors() {
+        for wrapped in [false, true] {
+            for (error, expected) in [
+                (
+                    oo7::dbus::Error::Service(oo7::dbus::ServiceError::NoSession(String::new())),
+                    KeyringErrorKind::Connection,
+                ),
+                (
+                    oo7::dbus::Error::ZBus(oo7::zbus::Error::InputOutput(Arc::new(
+                        std::io::Error::from(ErrorKind::BrokenPipe),
+                    ))),
+                    KeyringErrorKind::Connection,
+                ),
+                (
+                    oo7::dbus::Error::Service(oo7::dbus::ServiceError::ZBus(
+                        oo7::zbus::Error::FDO(Box::new(oo7::zbus::fdo::Error::UnknownObject(
+                            String::new(),
+                        ))),
+                    )),
+                    KeyringErrorKind::MissingObject,
+                ),
+                (
+                    oo7::dbus::Error::ZBus(oo7::zbus::Error::FDO(Box::new(
+                        oo7::zbus::fdo::Error::ZBus(oo7::zbus::Error::InputOutput(Arc::new(
+                            std::io::Error::from(ErrorKind::BrokenPipe),
+                        ))),
+                    ))),
+                    KeyringErrorKind::Connection,
+                ),
+                (
+                    oo7::dbus::Error::Service(oo7::dbus::ServiceError::IsLocked(String::new())),
+                    KeyringErrorKind::Other,
+                ),
+                (oo7::dbus::Error::Dismissed, KeyringErrorKind::Other),
+            ] {
+                let error = if wrapped {
+                    anyhow!(oo7::Error::DBus(error))
+                } else {
+                    anyhow!(error)
+                }
+                .context("keyring operation failed");
+                assert_eq!(classify_keyring_error(&error), expected, "{error:#}");
+            }
+        }
+    }
+
+    mod keyring {
+        use super::*;
+        use oo7::zbus::{
+            self, Connection, fdo,
+            message::Header,
+            names::BusName,
+            object_server::{ResponseDispatchNotifier, SignalEmitter},
+            zvariant::{OwnedObjectPath, OwnedValue, Str, Value},
+        };
+        use std::{collections::HashMap, process::Command};
+
+        #[test]
+        fn reuses_connection_after_concurrent_calls_and_ordinary_errors() {
+            run_on_private_bus(
+                "reuses_connection_after_concurrent_calls_and_ordinary_errors",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    let (opened, opening) = oneshot::channel();
+                    let (release, released) = oneshot::channel();
+                    state.lock().open_gate = Some((opened, released));
+                    let reads = (0..3)
+                        .map(|_| platform.read_credentials("keyring-test"))
+                        .collect::<Vec<_>>();
+                    opening.await.expect("session opening started");
+                    assert_eq!(state.lock().opened, 1);
+                    drop(reads);
+                    let reads = (0..3)
+                        .map(|_| platform.read_credentials("keyring-test"))
+                        .collect::<Vec<_>>();
+                    release.send(()).expect("release session opening");
+                    for result in futures::future::join_all(reads).await {
+                        assert_eq!(result.expect("initial read"), None);
+                    }
+                    assert_eq!(state.lock().opened, 1);
+                    platform
+                        .write_credentials("keyring-test", "user", b"secret")
+                        .await
+                        .expect("write credential");
+                    state.lock().fail_label = true;
+                    platform
+                        .read_credentials("keyring-test")
+                        .await
+                        .expect_err("label access denied");
+                    state.lock().fail_label = false;
+                    state.lock().missing_username = true;
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect_err("malformed credential")
+                            .to_string(),
+                        "Cannot find username in stored credentials"
+                    );
+                    state.lock().missing_username = false;
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("read"),
+                        Some(("user".to_owned(), b"secret".to_vec()))
+                    );
+                    assert_eq!(state.lock().opened, 1);
+                    platform
+                        .with_keyring(true, |_| async {
+                            Err::<(), _>(anyhow!(oo7::dbus::Error::Dismissed))
+                        })
+                        .await
+                        .expect_err("dismissed operation");
+                    platform
+                        .read_credentials("keyring-test")
+                        .await
+                        .expect("read");
+                    assert_eq!(state.lock().opened, 1);
+                    daemon.close().await.expect("close service");
+                },
+            );
+        }
+
+        #[test]
+        fn skips_unreadable_candidates_when_reading_and_deleting_credentials() {
+            run_on_private_bus(
+                "skips_unreadable_candidates_when_reading_and_deleting_credentials",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    for missing_item in [false, true] {
+                        state.lock().unreadable_item_missing = missing_item;
+                        for unreadable_first in [true, false] {
+                            state.lock().unreadable_item_first = Some(unreadable_first);
+                            platform
+                                .write_credentials("keyring-test", "user", b"secret")
+                                .await
+                                .expect("write credential");
+                            assert_eq!(
+                                platform
+                                    .read_credentials("keyring-test")
+                                    .await
+                                    .expect("read despite unreadable candidate"),
+                                Some(("user".to_owned(), b"secret".to_vec()))
+                            );
+                            platform
+                                .delete_credentials("keyring-test")
+                                .await
+                                .expect("delete despite unreadable candidate");
+                            assert_eq!(state.lock().secret, None);
+                            let read = platform.read_credentials("keyring-test").await;
+                            let delete = platform.delete_credentials("keyring-test").await;
+                            if missing_item {
+                                assert_eq!(read.expect("skip missing candidate"), None);
+                                delete.expect("skip missing candidate");
+                            } else {
+                                for error in [
+                                    read.expect_err(
+                                        "retain label error when no credential can be read",
+                                    ),
+                                    delete.expect_err(
+                                        "retain label error when no credential can be deleted",
+                                    ),
+                                ] {
+                                    let oo7::Error::DBus(oo7::dbus::Error::ZBus(zbus::Error::FDO(
+                                        error,
+                                    ))) = error
+                                        .downcast::<oo7::Error>()
+                                        .expect("keyring label error")
+                                    else {
+                                        panic!("expected a D-Bus property error");
+                                    };
+                                    let fdo::Error::AccessDenied(message) = *error else {
+                                        panic!("expected a label access error");
+                                    };
+                                    assert_eq!(message, "foreign label access denied");
+                                }
+                            }
+                            assert_eq!(state.lock().opened, 1);
+                        }
+                    }
+                    daemon.close().await.expect("close service");
+                },
+            );
+        }
+
+        #[test]
+        fn reconnects_before_reads_and_mutations_after_restart() {
+            run_on_private_bus(
+                "reconnects_before_reads_and_mutations_after_restart",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    platform
+                        .write_credentials("keyring-test", "user", b"first")
+                        .await
+                        .expect("initial write");
+                    let daemon = restart_service(daemon, state.clone()).await;
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("read after restart"),
+                        Some(("user".to_owned(), b"first".to_vec()))
+                    );
+                    assert_eq!(state.lock().opened, 2);
+                    let daemon = restart_service(daemon, state.clone()).await;
+                    platform
+                        .write_credentials("keyring-test", "user", b"second")
+                        .await
+                        .expect("write after restart");
+                    assert_eq!(state.lock().opened, 3);
+                    assert_eq!(state.lock().rejected_sessions, 0);
+                    assert_eq!(state.lock().writes, 2);
+                    let daemon = restart_service(daemon, state.clone()).await;
+                    platform
+                        .delete_credentials("keyring-test")
+                        .await
+                        .expect("delete after restart");
+                    assert_eq!(state.lock().opened, 4);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("deleted"),
+                        None
+                    );
+                    state.lock().default_collection = Some(object_path(
+                        "/org/freedesktop/secrets/collection/replacement",
+                    ));
+                    platform
+                        .write_credentials("keyring-test", "user", b"replacement")
+                        .await
+                        .expect("write after default collection changed");
+                    assert_eq!(state.lock().opened, 5);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("read from replacement collection"),
+                        Some(("user".to_owned(), b"replacement".to_vec()))
+                    );
+                    assert_eq!(state.lock().opened, 5);
+                    daemon.close().await.expect("close service");
+                },
+            );
+        }
+
+        #[test]
+        fn serializes_recovery_without_replaying_mutations_or_running_canceled_calls() {
+            run_on_private_bus(
+                "serializes_recovery_without_replaying_mutations_or_running_canceled_calls",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    state.lock().fail_write_reply = true;
+                    platform
+                        .write_credentials("keyring-test", "user", b"committed")
+                        .await
+                        .expect_err("lost write reply");
+                    assert_eq!(state.lock().writes, 1);
+                    assert_eq!(state.lock().opened, 1);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("read committed write"),
+                        Some(("user".to_owned(), b"committed".to_vec()))
+                    );
+                    assert_eq!(state.lock().opened, 2);
+                    let (entered, entering) = smol::channel::bounded(1);
+                    let (release, released) = smol::channel::bounded(1);
+                    let delayed_failure = platform.with_keyring(false, move |_| {
+                        let entered = entered.clone();
+                        let released = released.clone();
+                        async move {
+                            entered.send(()).await?;
+                            released.recv().await?;
+                            Err::<(), _>(disconnected())
+                        }
+                    });
+                    entering.recv().await.expect("operation started");
+                    let canceled_attempts = Arc::new(Mutex::new(0));
+                    let canceled = platform.with_keyring(false, {
+                        let canceled_attempts = canceled_attempts.clone();
+                        move |_| async move {
+                            *canceled_attempts.lock() += 1;
+                            Err::<(), _>(disconnected())
+                        }
+                    });
+                    let mut recovery = platform.read_credentials("keyring-test");
+                    assert!((&mut recovery).now_or_never().is_none());
+                    drop(canceled);
+                    assert_eq!(state.lock().opened, 2);
+                    release.send(()).await.expect("release delayed failure");
+                    delayed_failure.await.expect_err("delayed disconnect");
+                    assert_eq!(
+                        recovery.await.expect("queued read reconnects"),
+                        Some(("user".to_owned(), b"committed".to_vec()))
+                    );
+                    assert_eq!(*canceled_attempts.lock(), 0);
+                    assert_eq!(state.lock().opened, 3);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("reuse recovered session"),
+                        Some(("user".to_owned(), b"committed".to_vec()))
+                    );
+                    assert_eq!(state.lock().opened, 3);
+                    let connection = platform
+                        .secret_service
+                        .lock()
+                        .await
+                        .connected
+                        .as_ref()
+                        .expect("cached connection")
+                        .bus
+                        .inner()
+                        .connection()
+                        .clone();
+                    connection.close().await.expect("disconnect owner lookup");
+                    platform
+                        .read_credentials("keyring-test")
+                        .await
+                        .expect("recover owner lookup");
+                    assert_eq!(state.lock().opened, 4);
+                    for (read_only, expected_attempts) in [(true, 2), (false, 1)] {
+                        let attempts = Arc::new(Mutex::new(0));
+                        platform
+                            .with_keyring(read_only, {
+                                let attempts = attempts.clone();
+                                move |_| {
+                                    let attempts = attempts.clone();
+                                    async move {
+                                        *attempts.lock() += 1;
+                                        Err::<(), _>(anyhow!(oo7::dbus::Error::Service(
+                                            oo7::dbus::ServiceError::NoSession(
+                                                "expired session".to_owned()
+                                            )
+                                        )))
+                                    }
+                                }
+                            })
+                            .await
+                            .expect_err("expired session");
+                        assert_eq!(*attempts.lock(), expected_attempts);
+                    }
+                    platform
+                        .read_credentials("keyring-test")
+                        .await
+                        .expect("warm session before invalidation");
+                    let (opened, writes) = {
+                        let mut state = state.lock();
+                        state.sessions.clear();
+                        (state.opened, state.writes)
+                    };
+                    let error = platform
+                        .write_credentials("keyring-test", "user", b"retry")
+                        .await
+                        .expect_err("expired Qt session");
+                    assert_eq!(state.lock().opened, opened);
+                    assert_eq!(state.lock().writes, writes);
+                    assert_eq!(state.lock().rejected_sessions, 1);
+                    platform
+                        .write_credentials("keyring-test", "user", b"retry")
+                        .await
+                        .expect("write with a fresh session");
+                    assert_eq!(state.lock().opened, opened + 1);
+                    assert_eq!(state.lock().writes, writes + 1);
+                    assert_eq!(state.lock().rejected_sessions, 1);
+                    assert_eq!(
+                        classify_keyring_error(&error),
+                        KeyringErrorKind::MissingObject
+                    );
+                    daemon.close().await.expect("close service");
+                },
+            );
+        }
+
+        #[test]
+        fn rechecks_owner_after_unlock_without_replaying_a_mid_write_restart() {
+            run_on_private_bus(
+                "rechecks_owner_after_unlock_without_replaying_a_mid_write_restart",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    platform
+                        .read_credentials("keyring-test")
+                        .await
+                        .expect("initial session");
+                    let (entered, entering) = oneshot::channel();
+                    let (release, released) = oneshot::channel();
+                    state.lock().unlock_gate = Some((entered, released));
+                    let write = platform.write_credentials("keyring-test", "user", b"first");
+                    entering.await.expect("unlock started");
+                    let replacement = replace_service_owner(&daemon, state.clone()).await;
+                    release.send(()).expect("release unlock");
+                    write.await.expect("reconnect before write");
+                    assert_eq!(state.lock().opened, 2);
+                    assert_eq!(state.lock().writes, 1);
+                    assert_eq!(state.lock().rejected_sessions, 0);
+                    daemon.close().await.expect("close previous service");
+
+                    let (entered, entering) = smol::channel::bounded(1);
+                    let (release, released) = smol::channel::bounded(1);
+                    let write = platform.with_keyring(false, move |keyring| {
+                        let entered = entered.clone();
+                        let released = released.clone();
+                        async move {
+                            entered.send(()).await?;
+                            released.recv().await?;
+                            keyring
+                                .create_item(
+                                    KEYRING_LABEL,
+                                    &[("url", "keyring-test"), ("username", "user")],
+                                    b"second".to_vec(),
+                                    true,
+                                )
+                                .await?;
+                            Ok(())
+                        }
+                    });
+                    entering.recv().await.expect("mutation started");
+                    let replacement = restart_service(replacement, state.clone()).await;
+                    let error = write.await.expect_err("restart during mutation");
+                    assert!(release.send(()).await.is_err());
+                    assert_eq!(classify_keyring_error(&error), KeyringErrorKind::Connection);
+                    assert_eq!(state.lock().opened, 2);
+                    assert_eq!(state.lock().writes, 1);
+                    assert_eq!(state.lock().rejected_sessions, 0);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("recover on next call"),
+                        Some(("user".to_owned(), b"first".to_vec()))
+                    );
+                    assert_eq!(state.lock().opened, 3);
+                    replacement.close().await.expect("close service");
+                },
+            );
+        }
+
+        #[test]
+        fn disconnects_canceled_unlock_prompts_and_reuses_completed_sessions() {
+            run_on_private_bus(
+                "disconnects_canceled_unlock_prompts_and_reuses_completed_sessions",
+                async {
+                    for target in [
+                        "/org/freedesktop/secrets/collection/default",
+                        "/org/freedesktop/secrets/item/1",
+                    ] {
+                        for outcome in [
+                            PromptOutcome::CancelBeforeReply,
+                            PromptOutcome::CancelAfterReply,
+                            PromptOutcome::Complete,
+                            PromptOutcome::Dismiss,
+                        ] {
+                            let state = Arc::new(Mutex::new(ServiceState::default()));
+                            let daemon = start_service(state.clone()).await;
+                            let bus = fdo::DBusProxy::new(&daemon).await.expect("bus proxy");
+                            let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                            platform
+                                .write_credentials("keyring-test", "user", b"secret")
+                                .await
+                                .expect("seed credential");
+                            let (entered, entering) = oneshot::channel();
+                            let (release, released) = oneshot::channel();
+                            {
+                                let mut state = state.lock();
+                                state.prompt_target = Some(object_path(target));
+                                state.prompt_gate = Some((entered, released));
+                                state.defer_session_close = true;
+                            }
+                            let read = platform.read_credentials("keyring-test");
+                            let (caller, reply_dispatched) =
+                                entering.await.expect("prompt started");
+                            assert_eq!(
+                                state.lock().sessions.values().cloned().collect::<Vec<_>>(),
+                                vec![caller.clone()],
+                                "{target}: {outcome:?}"
+                            );
+                            let mut disconnected = bus
+                                .receive_name_owner_changed_with_args(&[
+                                    (0, caller.as_str()),
+                                    (2, ""),
+                                ])
+                                .await
+                                .expect("watch prompt caller disconnect");
+                            let mut queued = platform.read_credentials("keyring-test");
+                            assert!((&mut queued).now_or_never().is_none());
+                            assert_eq!(state.lock().opened, 1);
+                            let release_reply = async move {
+                                release.send(()).expect("release prompt reply");
+                                reply_dispatched.await;
+                            };
+                            futures::pin_mut!(release_reply);
+                            if outcome != PromptOutcome::CancelBeforeReply {
+                                release_reply.as_mut().await;
+                            }
+                            let expected_sessions = match outcome {
+                                PromptOutcome::CancelBeforeReply
+                                | PromptOutcome::CancelAfterReply => {
+                                    drop(read);
+                                    let signal = disconnected
+                                        .next()
+                                        .await
+                                        .expect("canceled prompt caller disconnected");
+                                    let arguments =
+                                        signal.args().expect("name owner changed arguments");
+                                    assert_eq!(arguments.name().as_str(), caller);
+                                    assert_eq!(
+                                        arguments.old_owner().as_ref().map(|owner| owner.as_str()),
+                                        Some(caller.as_str())
+                                    );
+                                    assert_eq!(
+                                        arguments.new_owner().as_ref().map(|owner| owner.as_str()),
+                                        None
+                                    );
+                                    if outcome == PromptOutcome::CancelBeforeReply {
+                                        release_reply.await;
+                                    }
+                                    2
+                                }
+                                PromptOutcome::Complete | PromptOutcome::Dismiss => {
+                                    let emitter = SignalEmitter::new(
+                                        &daemon,
+                                        "/org/freedesktop/secrets/prompt/1",
+                                    )
+                                    .expect("prompt signal emitter");
+                                    TestPrompt::completed(
+                                        &emitter,
+                                        outcome == PromptOutcome::Dismiss,
+                                        OwnedValue::try_from(Value::from(vec![object_path(
+                                            target,
+                                        )]))
+                                        .expect("unlocked paths"),
+                                    )
+                                    .await
+                                    .expect("complete prompt");
+                                    if outcome == PromptOutcome::Dismiss {
+                                        let error = read.await.expect_err("dismissed prompt");
+                                        let oo7::Error::DBus(oo7::dbus::Error::Dismissed) =
+                                            error.downcast::<oo7::Error>().expect("keyring error")
+                                        else {
+                                            panic!("expected prompt dismissal");
+                                        };
+                                    } else {
+                                        assert_eq!(
+                                            read.await.expect("completed prompt read"),
+                                            Some(("user".to_owned(), b"secret".to_vec()))
+                                        );
+                                    }
+                                    assert!(
+                                        bus.name_has_owner(
+                                            BusName::try_from(caller.as_str())
+                                                .expect("caller name")
+                                        )
+                                        .await
+                                        .expect("prompt caller owner")
+                                    );
+                                    1
+                                }
+                            };
+                            assert_eq!(
+                                queued.await.expect("queued read survives prompt outcome"),
+                                Some(("user".to_owned(), b"secret".to_vec())),
+                                "{target}: {outcome:?}"
+                            );
+                            assert_eq!(state.lock().opened, expected_sessions);
+                            let session = object_path(&format!(
+                                "/org/freedesktop/secrets/session/{expected_sessions}"
+                            ));
+                            let recovered_caller = state
+                                .lock()
+                                .sessions
+                                .get(&session)
+                                .expect("recovered session")
+                                .clone();
+                            if expected_sessions == 2 {
+                                assert_ne!(recovered_caller, caller);
+                            } else {
+                                assert_eq!(recovered_caller, caller);
+                            }
+                            assert_eq!(
+                                platform
+                                    .read_credentials("keyring-test")
+                                    .await
+                                    .expect("reuse session after prompt outcome"),
+                                Some(("user".to_owned(), b"secret".to_vec()))
+                            );
+                            assert_eq!(state.lock().opened, expected_sessions);
+                            assert_eq!(state.lock().rejected_sessions, 0);
+                            assert_eq!(state.lock().session_closes, 0);
+                            daemon.close().await.expect("close service");
+                        }
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn lost_completed_reads_recover_after_owner_loss() {
+            run_on_private_bus("lost_completed_reads_recover_after_owner_loss", async {
+                for (operation, loss) in [
+                    (
+                        CredentialOperation::ReadCollection,
+                        ConnectionLoss::ReplaceOwner,
+                    ),
+                    (CredentialOperation::ReadItem, ConnectionLoss::ReleaseOwner),
+                    (
+                        CredentialOperation::CreateCollection,
+                        ConnectionLoss::ReplaceOwner,
+                    ),
+                    (
+                        CredentialOperation::ReadItem,
+                        ConnectionLoss::MonitorDisconnected,
+                    ),
+                ] {
+                    assert_lost_completed_recovery(operation, loss).await;
+                }
+            });
+        }
+
+        #[test]
+        fn lost_completed_mutations_are_not_replayed_after_owner_loss() {
+            run_on_private_bus(
+                "lost_completed_mutations_are_not_replayed_after_owner_loss",
+                async {
+                    for (operation, loss) in [
+                        (CredentialOperation::Write, ConnectionLoss::ReplaceOwner),
+                        (CredentialOperation::Delete, ConnectionLoss::ReplaceOwner),
+                        (
+                            CredentialOperation::Write,
+                            ConnectionLoss::MonitorDisconnected,
+                        ),
+                    ] {
+                        assert_lost_completed_recovery(operation, loss).await;
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn owner_loss_during_session_setup_releases_the_cached_initializer() {
+            run_on_private_bus(
+                "owner_loss_during_session_setup_releases_the_cached_initializer",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    let (entered, entering) = oneshot::channel();
+                    let (release, released) = oneshot::channel();
+                    state.lock().open_gate = Some((entered, released));
+                    let read = platform.read_credentials("keyring-test");
+                    entering.await.expect("session opening started");
+                    let replacement = replace_service_owner(&daemon, state.clone()).await;
+                    assert_eq!(read.await.expect("recover interrupted initializer"), None);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("new initializer"),
+                        None
+                    );
+                    assert_eq!(state.lock().opened, 2);
+                    release.send(()).expect("release old session handler");
+                    replacement.close().await.expect("close replacement");
+                    daemon.close().await.expect("close original service");
+                },
+            );
+        }
+
+        #[test]
+        fn canceled_session_setup_recovers_after_restart_for_reads_and_mutations() {
+            run_on_private_bus(
+                "canceled_session_setup_recovers_after_restart_for_reads_and_mutations",
+                async {
+                    for create_collection in [false, true] {
+                        for restart in [false, true] {
+                            for mutate in [false, true] {
+                                let state = Arc::new(Mutex::new(ServiceState::default()));
+                                let daemon = start_service(state.clone()).await;
+                                let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                                let (entered, entering) = oneshot::channel();
+                                let (prompted, prompting) = oneshot::channel();
+                                let (release, released) = oneshot::channel();
+                                let collection =
+                                    object_path("/org/freedesktop/secrets/collection/default");
+                                if create_collection {
+                                    let mut state = state.lock();
+                                    state.default_collection = Some(object_path("/"));
+                                    state.prompt_target = Some(collection.clone());
+                                    state.prompt_gate = Some((prompted, released));
+                                    state.defer_session_close = true;
+                                } else {
+                                    state.lock().open_gate = Some((entered, released));
+                                }
+                                let canceled = platform.read_credentials("keyring-test");
+                                let dispatched = if create_collection {
+                                    Some(prompting.await.expect("collection prompt started").1)
+                                } else {
+                                    entering.await.expect("session opening started");
+                                    None
+                                };
+                                drop(canceled);
+                                drop(platform.secret_service.lock().await);
+                                let replacement = if restart {
+                                    Some(replace_service_owner(&daemon, state.clone()).await)
+                                } else {
+                                    None
+                                };
+                                release.send(()).expect("release initialization");
+                                if let Some(dispatched) = dispatched {
+                                    dispatched.await;
+                                    if !restart {
+                                        let emitter = SignalEmitter::new(
+                                            &daemon,
+                                            "/org/freedesktop/secrets/prompt/1",
+                                        )
+                                        .expect("prompt emitter");
+                                        TestPrompt::completed(
+                                            &emitter,
+                                            false,
+                                            OwnedValue::try_from(Value::from(collection))
+                                                .expect("created collection path"),
+                                        )
+                                        .await
+                                        .expect("complete collection creation");
+                                    }
+                                }
+                                if mutate {
+                                    platform
+                                        .write_credentials("keyring-test", "user", b"recovered")
+                                        .await
+                                        .expect("write after canceled initialization");
+                                } else {
+                                    assert_eq!(
+                                        platform
+                                            .read_credentials("keyring-test")
+                                            .await
+                                            .expect("read after canceled initialization"),
+                                        None
+                                    );
+                                }
+                                {
+                                    let state = state.lock();
+                                    assert_eq!(state.opened, 1 + usize::from(restart));
+                                    assert_eq!(state.writes, usize::from(mutate));
+                                    assert_eq!(state.secret, mutate.then(|| b"recovered".to_vec()));
+                                    assert_eq!(
+                                        state.collections_created,
+                                        usize::from(create_collection)
+                                    );
+                                    if !restart {
+                                        assert_eq!(state.session_closes, 0);
+                                    }
+                                }
+                                if let Some(replacement) = replacement {
+                                    replacement.close().await.expect("close replacement");
+                                }
+                                daemon.close().await.expect("close original service");
+                            }
+                        }
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn filters_idle_monitor_traffic_and_recovers_after_owner_churn() {
+            run_on_private_bus(
+                "filters_idle_monitor_traffic_and_recovers_after_owner_churn",
+                async {
+                    let state = Arc::new(Mutex::new(ServiceState::default()));
+                    let daemon = start_service(state.clone()).await;
+                    let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("warm cache"),
+                        None
+                    );
+                    let monitor = platform
+                        .secret_service
+                        .lock()
+                        .await
+                        .connected
+                        .as_ref()
+                        .expect("cached connection")
+                        .bus
+                        .clone();
+                    let destination = monitor
+                        .inner()
+                        .connection()
+                        .unique_name()
+                        .expect("monitor name");
+                    let owner = daemon.unique_name().expect("service owner").clone();
+                    for sequence in 0..128u32 {
+                        for destination in [None, Some(destination.as_str())] {
+                            daemon
+                                .emit_signal(
+                                    destination,
+                                    "/noise",
+                                    "org.zed.Noise",
+                                    "Noise",
+                                    &sequence,
+                                )
+                                .await
+                                .expect("unrelated signal");
+                        }
+                        daemon
+                            .emit_signal(
+                                Some(destination.as_str()),
+                                "/org/freedesktop/DBus",
+                                "org.freedesktop.DBus",
+                                "NameOwnerChanged",
+                                &(SECRET_SERVICE_NAME.as_str(), owner.as_str(), ""),
+                            )
+                            .await
+                            .expect("forged owner change");
+                    }
+                    fdo::DBusProxy::new(&daemon)
+                        .await
+                        .expect("service bus proxy")
+                        .get_name_owner(BusName::WellKnown(SECRET_SERVICE_NAME))
+                        .await
+                        .expect("traffic barrier");
+                    assert_eq!(
+                        monitor
+                            .get_name_owner(BusName::WellKnown(SECRET_SERVICE_NAME))
+                            .await
+                            .expect("idle monitor rejects unrelated traffic"),
+                        owner
+                    );
+                    drop(monitor);
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("forged signals do not invalidate the session"),
+                        None
+                    );
+                    assert_eq!(state.lock().opened, 1);
+                    for _ in 0..128 {
+                        assert!(
+                            daemon
+                                .release_name("org.freedesktop.secrets")
+                                .await
+                                .expect("release owner")
+                        );
+                        daemon
+                            .request_name("org.freedesktop.secrets")
+                            .await
+                            .expect("reacquire owner");
+                    }
+                    assert_eq!(
+                        platform
+                            .read_credentials("keyring-test")
+                            .await
+                            .expect("recover from saturated owner-change queue"),
+                        None
+                    );
+                    assert_eq!(state.lock().opened, 2);
+                    daemon.close().await.expect("close service");
+                },
+            );
+        }
+
+        async fn assert_lost_completed_recovery(
+            operation: CredentialOperation,
+            loss: ConnectionLoss,
+        ) {
+            let state = Arc::new(Mutex::new(ServiceState {
+                attributes: HashMap::from([
+                    ("url".to_owned(), "keyring-test".to_owned()),
+                    ("username".to_owned(), "user".to_owned()),
+                ]),
+                secret: Some(b"first".to_vec()),
+                ..ServiceState::default()
+            }));
+            let daemon = start_service(state.clone()).await;
+            let platform = LinuxPlatform::new(WindowingModes::HEADLESS);
+            if operation == CredentialOperation::CreateCollection {
+                state.lock().default_collection = Some(object_path("/"));
+            } else {
+                platform
+                    .read_credentials("keyring-test")
+                    .await
+                    .expect("warm cache");
+            }
+            let monitor = platform
+                .secret_service
+                .lock()
+                .await
+                .connected
+                .as_ref()
+                .map(|connection| connection.bus.inner().connection().clone());
+            let (entered, entering) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            {
+                let mut state = state.lock();
+                state.prompt_target = Some(object_path(match operation {
+                    CredentialOperation::ReadCollection | CredentialOperation::CreateCollection => {
+                        "/org/freedesktop/secrets/collection/default"
+                    }
+                    _ => "/org/freedesktop/secrets/item/1",
+                }));
+                state.prompt_gate = Some((entered, released));
+            }
+            let pending = match operation {
+                CredentialOperation::Write => platform
+                    .write_credentials("keyring-test", "user", b"second")
+                    .boxed(),
+                CredentialOperation::Delete => platform.delete_credentials("keyring-test").boxed(),
+                _ => platform
+                    .read_credentials("keyring-test")
+                    .map(|result| {
+                        result.map(|credentials| {
+                            assert_eq!(credentials, Some(("user".to_owned(), b"first".to_vec())));
+                        })
+                    })
+                    .boxed(),
+            };
+            let (_, dispatched) = entering.await.expect("prompt started");
+            release.send(()).expect("acknowledge prompt");
+            dispatched.await;
+            let queued = platform.read_credentials("keyring-test");
+            let replacement = match loss {
+                ConnectionLoss::ReplaceOwner => {
+                    Some(replace_service_owner(&daemon, state.clone()).await)
+                }
+                ConnectionLoss::ReleaseOwner => {
+                    assert!(
+                        daemon
+                            .release_name("org.freedesktop.secrets")
+                            .await
+                            .expect("release owner")
+                    );
+                    daemon
+                        .request_name("org.freedesktop.secrets")
+                        .await
+                        .expect("reacquire owner");
+                    None
+                }
+                ConnectionLoss::MonitorDisconnected => {
+                    monitor
+                        .expect("cached monitor")
+                        .close()
+                        .await
+                        .expect("disconnect monitor");
+                    None
+                }
+            };
+            let result = pending.await;
+            if operation == CredentialOperation::Write || operation == CredentialOperation::Delete {
+                let error = result.expect_err("do not replay an interrupted mutation");
+                assert_eq!(classify_keyring_error(&error), KeyringErrorKind::Connection);
+            } else if loss == ConnectionLoss::ReleaseOwner {
+                if let Err(error) = result {
+                    assert_eq!(classify_keyring_error(&error), KeyringErrorKind::Connection);
+                }
+            } else {
+                result.expect("retry interrupted read");
+            }
+            let expected = match operation {
+                CredentialOperation::Write => Some(("user".to_owned(), b"second".to_vec())),
+                CredentialOperation::Delete => None,
+                _ => Some(("user".to_owned(), b"first".to_vec())),
+            };
+            let queued_result = queued.await;
+            if loss == ConnectionLoss::ReleaseOwner && queued_result.is_err() {
+                assert_eq!(
+                    classify_keyring_error(&queued_result.expect_err("owner gap")),
+                    KeyringErrorKind::Connection
+                );
+            } else {
+                assert_eq!(queued_result.expect("queued read is unblocked"), expected);
+            }
+            assert_eq!(
+                platform
+                    .read_credentials("keyring-test")
+                    .await
+                    .expect("recovered read"),
+                expected
+            );
+            let state = state.lock();
+            assert_eq!(
+                state.writes,
+                usize::from(operation == CredentialOperation::Write)
+            );
+            assert_eq!(
+                state.deletes,
+                usize::from(operation == CredentialOperation::Delete)
+            );
+            assert_eq!(
+                state.collections_created,
+                usize::from(operation == CredentialOperation::CreateCollection)
+            );
+            drop(state);
+            if let Some(replacement) = replacement {
+                replacement.close().await.expect("close replacement");
+            }
+            daemon.close().await.expect("close original service");
+        }
+
+        fn run_on_private_bus(name: &str, scenario: impl Future<Output = ()>) {
+            const CHILD_ENV: &str = "ZED_KEYRING_TEST";
+            if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+                smol::block_on(smol::future::or(scenario, async {
+                    smol::Timer::after(Duration::from_secs(5)).await;
+                    panic!("keyring scenario {name} timed out");
+                }));
+                return;
+            }
+            let test = format!("linux::platform::tests::keyring::{name}");
+            let output = Command::new("dbus-run-session")
+                .arg("--")
+                .arg(std::env::current_exe().expect("test executable"))
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD_ENV, name)
+                .output()
+                .expect("run test on a private D-Bus session");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        fn disconnected() -> anyhow::Error {
+            anyhow!(oo7::dbus::Error::ZBus(oo7::zbus::Error::FDO(Box::new(
+                fdo::Error::Disconnected("reply lost".to_owned())
+            ))))
+        }
+
+        async fn start_service(state: Arc<Mutex<ServiceState>>) -> Connection {
+            zbus::connection::Builder::session()
+                .expect("connect service to bus")
+                .serve_at("/org/freedesktop/secrets", TestService(state.clone()))
+                .expect("serve Secret Service")
+                .serve_at(
+                    "/org/freedesktop/secrets/collection/default",
+                    TestCollection(state.clone()),
+                )
+                .expect("serve collection")
+                .serve_at(
+                    "/org/freedesktop/secrets/collection/replacement",
+                    TestCollection(state.clone()),
+                )
+                .expect("serve replacement collection")
+                .serve_at("/org/freedesktop/secrets/item/1", TestItem(state.clone()))
+                .expect("serve item")
+                .serve_at(
+                    "/org/freedesktop/secrets/item/unreadable",
+                    UnreadableTestItem,
+                )
+                .expect("serve unreadable item")
+                .serve_at("/org/freedesktop/secrets/prompt/1", TestPrompt(state))
+                .expect("serve prompt")
+                .name("org.freedesktop.secrets")
+                .expect("service name")
+                .build()
+                .await
+                .expect("start service")
+        }
+
+        async fn restart_service(
+            connection: Connection,
+            state: Arc<Mutex<ServiceState>>,
+        ) -> Connection {
+            connection.close().await.expect("stop service");
+            state.lock().sessions.clear();
+            start_service(state).await
+        }
+
+        async fn replace_service_owner(
+            connection: &Connection,
+            state: Arc<Mutex<ServiceState>>,
+        ) -> Connection {
+            fdo::DBusProxy::new(connection)
+                .await
+                .expect("bus proxy")
+                .request_name(
+                    SECRET_SERVICE_NAME,
+                    fdo::RequestNameFlags::AllowReplacement.into(),
+                )
+                .await
+                .expect("allow replacement");
+            state.lock().sessions.clear();
+            start_service(state).await
+        }
+
+        fn object_path(path: &str) -> OwnedObjectPath {
+            OwnedObjectPath::try_from(path.to_owned()).expect("valid object path")
+        }
+
+        type TestSecret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
+        type PromptCall = (String, BoxFuture<'static, ()>);
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum PromptOutcome {
+            CancelBeforeReply,
+            CancelAfterReply,
+            Complete,
+            Dismiss,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum CredentialOperation {
+            ReadCollection,
+            ReadItem,
+            CreateCollection,
+            Write,
+            Delete,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum ConnectionLoss {
+            ReplaceOwner,
+            ReleaseOwner,
+            MonitorDisconnected,
+        }
+
+        #[derive(Default)]
+        struct ServiceState {
+            sessions: HashMap<OwnedObjectPath, String>,
+            opened: usize,
+            writes: usize,
+            deletes: usize,
+            collections_created: usize,
+            rejected_sessions: usize,
+            session_closes: usize,
+            defer_session_close: bool,
+            default_collection: Option<OwnedObjectPath>,
+            attributes: HashMap<String, String>,
+            secret: Option<Vec<u8>>,
+            missing_username: bool,
+            fail_label: bool,
+            unreadable_item_first: Option<bool>,
+            unreadable_item_missing: bool,
+            fail_write_reply: bool,
+            open_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+            unlock_gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+            prompt_target: Option<OwnedObjectPath>,
+            prompt_gate: Option<(oneshot::Sender<PromptCall>, oneshot::Receiver<()>)>,
+        }
+
+        impl ServiceState {
+            fn take_prompt(&mut self, objects: &[OwnedObjectPath]) -> OwnedObjectPath {
+                if self
+                    .prompt_target
+                    .as_ref()
+                    .is_some_and(|target| objects.iter().any(|object| object == target))
+                {
+                    self.prompt_target = None;
+                    object_path("/org/freedesktop/secrets/prompt/1")
+                } else {
+                    object_path("/")
+                }
+            }
+
+            fn check_session(
+                &mut self,
+                path: &OwnedObjectPath,
+                header: &Header<'_>,
+            ) -> fdo::Result<()> {
+                if self.sessions.get(path).map(String::as_str)
+                    == header.sender().map(|sender| sender.as_str())
+                {
+                    Ok(())
+                } else {
+                    self.rejected_sessions += 1;
+                    Err(fdo::Error::UnknownObject("invalid session".to_owned()))
+                }
+            }
+        }
+
+        struct TestService(Arc<Mutex<ServiceState>>);
+
+        #[oo7::zbus::interface(name = "org.freedesktop.Secret.Service", crate = "oo7::zbus")]
+        impl TestService {
+            async fn open_session(
+                &self,
+                algorithm: &str,
+                _input: OwnedValue,
+                #[zbus(header)] header: Header<'_>,
+                #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+            ) -> fdo::Result<(OwnedValue, OwnedObjectPath)> {
+                if algorithm != "plain" {
+                    return Err(fdo::Error::NotSupported("plain test service".to_owned()));
+                }
+                let (path, gate) = {
+                    let mut state = self.0.lock();
+                    let path = object_path(&format!(
+                        "/org/freedesktop/secrets/session/{}",
+                        state.sessions.len() + 1
+                    ));
+                    state
+                        .sessions
+                        .insert(path.clone(), header.sender().expect("sender").to_string());
+                    state.opened += 1;
+                    (path, state.open_gate.take())
+                };
+                emitter
+                    .connection()
+                    .object_server()
+                    .at(path.clone(), TestSession(self.0.clone()))
+                    .await
+                    .expect("serve session");
+                if let Some((entered, released)) = gate {
+                    entered.send(()).expect("session opening observed");
+                    released.await.expect("session opening released");
+                }
+                Ok((OwnedValue::from(Str::from("")), path))
+            }
+
+            fn read_alias(&self, _name: &str) -> OwnedObjectPath {
+                self.0
+                    .lock()
+                    .default_collection
+                    .clone()
+                    .unwrap_or_else(|| object_path("/org/freedesktop/secrets/collection/default"))
+            }
+
+            fn create_collection(
+                &self,
+                _properties: HashMap<String, OwnedValue>,
+                _alias: &str,
+            ) -> (OwnedObjectPath, OwnedObjectPath) {
+                let mut state = self.0.lock();
+                let collection = object_path("/org/freedesktop/secrets/collection/default");
+                state.default_collection = Some(collection.clone());
+                state.collections_created += 1;
+                let prompt = state.take_prompt(std::slice::from_ref(&collection));
+                (collection, prompt)
+            }
+
+            async fn unlock(
+                &self,
+                objects: Vec<OwnedObjectPath>,
+            ) -> (Vec<OwnedObjectPath>, OwnedObjectPath) {
+                let gate = self.0.lock().unlock_gate.take();
+                if let Some((entered, released)) = gate {
+                    entered.send(()).expect("unlock observed");
+                    released.await.expect("unlock released");
+                }
+                let mut state = self.0.lock();
+                let prompt = state.take_prompt(&objects);
+                if prompt == object_path("/") {
+                    (objects, prompt)
+                } else {
+                    (Vec::new(), prompt)
+                }
+            }
+        }
+
+        struct TestSession(Arc<Mutex<ServiceState>>);
+
+        #[oo7::zbus::interface(name = "org.freedesktop.Secret.Session", crate = "oo7::zbus")]
+        impl TestSession {
+            async fn close(&self) {
+                let defer = {
+                    let mut state = self.0.lock();
+                    state.session_closes += 1;
+                    state.defer_session_close
+                };
+                if defer {
+                    futures::future::pending::<()>().await;
+                }
+            }
+        }
+
+        struct TestPrompt(Arc<Mutex<ServiceState>>);
+
+        #[oo7::zbus::interface(name = "org.freedesktop.Secret.Prompt", crate = "oo7::zbus")]
+        impl TestPrompt {
+            async fn prompt(
+                &self,
+                _window_id: &str,
+                #[zbus(header)] header: Header<'_>,
+            ) -> ResponseDispatchNotifier<()> {
+                let (entered, released) = self.0.lock().prompt_gate.take().expect("prompt gate");
+                let (response, dispatched) = ResponseDispatchNotifier::new(());
+                assert!(
+                    entered
+                        .send((
+                            header.sender().expect("prompt caller").to_string(),
+                            dispatched.boxed(),
+                        ))
+                        .is_ok()
+                );
+                released.await.expect("prompt reply released");
+                response
+            }
+
+            #[zbus(signal)]
+            async fn completed(
+                emitter: &SignalEmitter<'_>,
+                dismissed: bool,
+                result: OwnedValue,
+            ) -> zbus::Result<()>;
+        }
+
+        struct TestMethodError {
+            name: &'static str,
+            message: String,
+        }
+
+        impl zbus::DBusError for TestMethodError {
+            fn create_reply(&self, header: &Header<'_>) -> zbus::Result<zbus::message::Message> {
+                zbus::message::Message::error(header, self.name())?.build(&self.message)
+            }
+
+            fn name(&self) -> zbus::names::ErrorName<'_> {
+                zbus::names::ErrorName::from_static_str_unchecked(self.name)
+            }
+
+            fn description(&self) -> Option<&str> {
+                Some(&self.message)
+            }
+        }
+
+        struct TestCollection(Arc<Mutex<ServiceState>>);
+
+        #[oo7::zbus::interface(name = "org.freedesktop.Secret.Collection", crate = "oo7::zbus")]
+        impl TestCollection {
+            fn search_items(&self, attributes: HashMap<String, String>) -> Vec<OwnedObjectPath> {
+                let state = self.0.lock();
+                if !attributes
+                    .iter()
+                    .all(|(key, value)| state.attributes.get(key) == Some(value))
+                {
+                    return Vec::new();
+                }
+                let mut items = Vec::new();
+                if state.secret.is_some() {
+                    items.push(object_path("/org/freedesktop/secrets/item/1"));
+                }
+                if let Some(unreadable_first) = state.unreadable_item_first {
+                    let unreadable = object_path(if state.unreadable_item_missing {
+                        "/org/freedesktop/secrets/item/missing"
+                    } else {
+                        "/org/freedesktop/secrets/item/unreadable"
+                    });
+                    if unreadable_first {
+                        items.insert(0, unreadable);
+                    } else {
+                        items.push(unreadable);
+                    }
+                }
+                items
+            }
+
+            fn create_item(
+                &self,
+                mut properties: HashMap<String, OwnedValue>,
+                secret: TestSecret,
+                _replace: bool,
+                #[zbus(header)] header: Header<'_>,
+            ) -> Result<(OwnedObjectPath, OwnedObjectPath), TestMethodError> {
+                let mut state = self.0.lock();
+                state
+                    .check_session(&secret.0, &header)
+                    .map_err(|_| TestMethodError {
+                        name: "org.qtproject.QtDBus.Error.InvalidObjectPath",
+                        message: format!("Can't find session {}", secret.0),
+                    })?;
+                state.attributes = HashMap::<String, String>::try_from(
+                    properties
+                        .remove("org.freedesktop.Secret.Item.Attributes")
+                        .expect("attributes"),
+                )
+                .expect("attribute map");
+                state.secret = Some(secret.2);
+                state.writes += 1;
+                if std::mem::take(&mut state.fail_write_reply) {
+                    return Err(TestMethodError {
+                        name: "org.freedesktop.DBus.Error.Disconnected",
+                        message: "reply lost after commit".to_owned(),
+                    });
+                }
+                let item = object_path("/org/freedesktop/secrets/item/1");
+                let prompt = state.take_prompt(std::slice::from_ref(&item));
+                Ok((item, prompt))
+            }
+        }
+
+        struct TestItem(Arc<Mutex<ServiceState>>);
+
+        #[oo7::zbus::interface(name = "org.freedesktop.Secret.Item", crate = "oo7::zbus")]
+        impl TestItem {
+            #[zbus(property)]
+            fn label(&self) -> fdo::Result<&str> {
+                if self.0.lock().fail_label {
+                    Err(fdo::Error::AccessDenied("label access denied".to_owned()))
+                } else {
+                    Ok(KEYRING_LABEL)
+                }
+            }
+
+            #[zbus(property)]
+            fn attributes(&self) -> HashMap<String, String> {
+                let state = self.0.lock();
+                let mut attributes = state.attributes.clone();
+                if state.missing_username {
+                    attributes.remove("username");
+                }
+                attributes
+            }
+
+            fn get_secret(
+                &self,
+                session: OwnedObjectPath,
+                #[zbus(header)] header: Header<'_>,
+            ) -> fdo::Result<(TestSecret,)> {
+                let mut state = self.0.lock();
+                state.check_session(&session, &header)?;
+                Ok(((
+                    session,
+                    Vec::new(),
+                    state.secret.clone().expect("stored secret"),
+                    "application/octet-stream".to_owned(),
+                ),))
+            }
+
+            fn delete(&self) -> OwnedObjectPath {
+                let mut state = self.0.lock();
+                state.secret = None;
+                state.deletes += 1;
+                state.take_prompt(&[object_path("/org/freedesktop/secrets/item/1")])
+            }
+        }
+
+        struct UnreadableTestItem;
+
+        #[oo7::zbus::interface(name = "org.freedesktop.Secret.Item", crate = "oo7::zbus")]
+        impl UnreadableTestItem {
+            #[zbus(property)]
+            fn label(&self) -> fdo::Result<&str> {
+                Err(fdo::Error::AccessDenied(
+                    "foreign label access denied".to_owned(),
+                ))
+            }
+        }
+    }
 
     #[cfg(any(feature = "wayland", feature = "x11"))]
     #[test]
