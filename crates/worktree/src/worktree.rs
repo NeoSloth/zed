@@ -154,6 +154,11 @@ pub struct LocalWorktree {
     share_private_files: bool,
     scanning_enabled: bool,
     force_defer_watch: bool,
+    /// root に到達できない状態かどうか。ネットワーク共有のマウントが解けた時に立って、
+    /// root が現れたら消える。開いているバッファの内容はそのまま保たれる。
+    root_unavailable: bool,
+    /// 到達できない root が再び現れたかを確かめるタスク。現れたら停止する。
+    root_availability_task: Option<Task<()>>,
 }
 
 pub struct PathPrefixScanRequest {
@@ -447,6 +452,21 @@ impl DerefMut for LocalSnapshot {
     }
 }
 
+/// マウントが解けたネットワークボリュームが戻ったかを確かめる間隔。
+/// 復旧は OS が行うので Zed が調べに行くが、stat 1 回をこの間隔で見る程度に留める。
+const ROOT_AVAILABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `path` が置かれた volume ごと到達できないのかを調べる。
+///
+/// macOS で SMB のマウントが解けると `/Volumes/<共有>` への stat まで失敗する。親に到達できるのに
+/// `path` だけが無いなら「ファイルが削除された」なので、従来どおり worktree を閉じる側へ寄せる。
+fn volume_of_path_is_unreachable(fs: &dyn Fs, path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    !fs.path_exists(parent) && fs.is_on_network_volume(path)
+}
+
 enum ScanState {
     Started,
     Updated {
@@ -459,6 +479,8 @@ enum ScanState {
         new_path: Arc<SanitizedPath>,
     },
     RootDeleted,
+    /// root に到達できないが、その volume が戻るのを待っている。
+    RootUnavailable,
 }
 
 struct UpdateObservationState {
@@ -477,6 +499,10 @@ pub enum Event {
     DeletedEntry(ProjectEntryId),
     /// The worktree root itself has been deleted (for single-file worktrees)
     Deleted,
+    /// root が置かれた volume ごと到達できない。復旧を待っている間も worktree は開いたまま。
+    RootUnavailable,
+    /// 到達できなかった root が再び現れた。snapshot の root entry は読み直されている。
+    RootAvailable,
 }
 
 impl EventEmitter<Event> for Worktree {}
@@ -492,10 +518,20 @@ impl Worktree {
         cx: &mut AsyncApp,
     ) -> Result<Entity<Self>> {
         let abs_path = path.into();
-        let metadata = fs
-            .metadata(&abs_path)
-            .await
-            .context("failed to stat worktree path")?;
+        // 到達できなくなった共有への stat は ENOTCONN のようなエラーで返る。ネットワーク共有では
+        // 「消えた」ように見えても戻るので、存在しない場合と同じ扱いにして復旧を待つ。
+        let metadata = match fs.metadata(&abs_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if fs.is_on_network_volume(&abs_path) => {
+                log::warn!("worktree root {abs_path:?} is unreachable: {error:#}");
+                None
+            }
+            Err(error) => {
+                return Err(error).context("failed to stat worktree path");
+            }
+        };
+        let wait_for_root_return =
+            metadata.is_none() && volume_of_path_is_unreachable(fs.as_ref(), &abs_path);
 
         let fs_case_sensitive = fs.is_case_sensitive().await;
 
@@ -611,8 +647,19 @@ impl Worktree {
                 settings,
                 scanning_enabled,
                 force_defer_watch: false,
+                root_unavailable: false,
+                root_availability_task: None,
             };
             worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
+
+            // 起動時に SMB がまだ繋がっていないと root 自体が存在しない。ファイルが消えた場合と
+            // は違い volume は戻る可能性があるので、復旧を待つ状態から始める。
+            // ここでは worktree を購読する側に状態を読む機会があるので、イベントは送らない。
+            if wait_for_root_return {
+                worktree.root_unavailable = true;
+                worktree.start_waiting_for_root_return(cx);
+            }
+
             Worktree::Local(worktree)
         }))
     }
@@ -1276,6 +1323,17 @@ impl Worktree {
         self.root_dir().is_none()
     }
 
+    /// root に現在到達できない状態か。ネットワーク共有のマウントが解けた時に立つ。
+    ///
+    /// 開いているバッファとその本文はそのまま保たれ、タブにはその状態が表示される。
+    /// 遠隔 worktree の切断は `remote::ConnectionState` が担うので、常に false。
+    pub fn root_unavailable(&self) -> bool {
+        match self {
+            Worktree::Local(local) => local.root_unavailable,
+            Worktree::Remote(_) => false,
+        }
+    }
+
     /// For visible worktrees, returns the path with the worktree name as the first component.
     /// Otherwise, returns an absolute path.
     pub fn full_path(&self, worktree_relative_path: &RelPath) -> PathBuf {
@@ -1425,6 +1483,13 @@ impl LocalWorktree {
                         }
                         ScanState::RootUpdated { new_path } => {
                             this.update_abs_path_and_refresh(new_path, cx);
+                        }
+                        ScanState::RootUnavailable => {
+                            log::info!(
+                                "worktree root {} is unreachable on a network volume, keeping it open until it returns",
+                                this.abs_path().display()
+                            );
+                            this.mark_root_unavailable(cx);
                         }
                         ScanState::RootDeleted => {
                             log::info!(
@@ -2234,11 +2299,96 @@ impl LocalWorktree {
         self.restart_background_scanners(cx);
     }
 
+    /// root が現れたかを定期的に確かめるタスクを開始する。
+    ///
+    /// 復旧は OS が行うので、Zed が自分から確認しに行くしかない。監視登録は root が消えた後に
+    /// 復旧を約束しないため、現れたら entries を読み直して、通常の「ディスクの内容を正にする」
+    /// 経路（`file_updated` -> `ReloadNeeded`）に載せる。
+    fn start_waiting_for_root_return(&mut self, cx: &mut Context<Worktree>) {
+        let fs = self.fs.clone();
+        let root_abs_path: Arc<Path> = self.abs_path().clone();
+
+        self.root_availability_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(ROOT_AVAILABILITY_RETRY_INTERVAL)
+                    .await;
+                let Some(worktree) = this.upgrade() else { return };
+                let still_waiting = worktree.read_with(cx, |worktree, _| {
+                    worktree
+                        .as_local()
+                        .is_some_and(|local| local.root_unavailable)
+                });
+                if !still_waiting {
+                    return;
+                }
+
+                // dead な共有への stat は応答しないことがあるので、前景スレッドでは調べない。
+                let metadata = match fs.metadata(&root_abs_path).await {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        log::debug!(
+                            "waiting for {} to become reachable: {error:#}",
+                            root_abs_path.display()
+                        );
+                        continue;
+                    }
+                };
+                let root_is_dir = metadata.is_dir;
+
+                // root の entry を作り直す。再読み込みを待たないと、古い entry のまま
+                // 「戻った」ことになってしまう。フォルダだった場合は中の entries ごと
+                // 読み直す必要があるので、root だけの再読み込みでは足りない。
+                let barrier = worktree.update(cx, |worktree, _| {
+                    let Some(local) = worktree.as_local_mut() else {
+                        return None;
+                    };
+                    if root_is_dir {
+                        Some(local.add_path_prefix_to_scan(RelPath::empty_arc()))
+                    } else {
+                        Some(local.refresh_entries_for_paths(vec![RelPath::empty_arc()]))
+                    }
+                });
+                if let Some(mut barrier) = barrier {
+                    barrier.recv().await;
+                }
+
+                let Some(worktree) = this.upgrade() else {
+                    return;
+                };
+                worktree.update(cx, |worktree, cx| {
+                    let Some(local) = worktree.as_local_mut() else {
+                        return;
+                    };
+                    local.root_unavailable = false;
+                    cx.emit(Event::RootAvailable);
+                    cx.notify();
+                });
+                return;
+            }
+        }));
+    }
+
+    /// root が属する volume へ到達できなくなったことを伝えて、復旧を待ち始める。
+    fn mark_root_unavailable(&mut self, cx: &mut Context<Worktree>) {
+        self.root_unavailable = true;
+        // 前に待機していたタスクがあれば破棄する（破くと work は止まる）。
+        self.root_availability_task = None;
+        self.start_waiting_for_root_return(cx);
+
+        cx.emit(Event::RootUnavailable);
+        cx.notify();
+    }
+
     pub fn update_abs_path_and_refresh(
         &mut self,
         new_path: Arc<SanitizedPath>,
         cx: &Context<Worktree>,
     ) {
+        // root が移動した = 到達できる場所に移ったので、待機は終わる。
+        self.root_unavailable = false;
+        self.root_availability_task = None;
         self.snapshot.git_repositories = Default::default();
         self.snapshot.ignores_by_parent_abs_path = Default::default();
         let root_name = new_path
@@ -4837,15 +4987,33 @@ impl BackgroundScanner {
             // For single-file worktrees, if we can't canonicalize and the file handle
             // fallback also failed, the file is gone - close the worktree
             if self.is_single_file {
-                log::info!(
-                    "single-file worktree root {:?} no longer exists, marking as deleted",
-                    root_path.as_path()
-                );
-                self.status_updates_tx
-                    .unbounded_send(ScanState::RootDeleted)
-                    .ok();
+                if self.root_volume_is_unreachable(root_path.as_path()) {
+                    log::info!(
+                        "single-file worktree root {:?} is unreachable because its volume is gone, waiting for it to return",
+                        root_path.as_path()
+                    );
+                    self.status_updates_tx
+                        .unbounded_send(ScanState::RootUnavailable)
+                        .ok();
+                } else {
+                    log::info!(
+                        "single-file worktree root {:?} no longer exists, marking as deleted",
+                        root_path.as_path()
+                    );
+                    self.status_updates_tx
+                        .unbounded_send(ScanState::RootDeleted)
+                        .ok();
+                }
             }
         }
+    }
+
+    /// root が置かれた volume ごと到達できない状態かを調べる。
+    ///
+    /// 共有が生きているのにファイルだけ消えた場合は false にして、従来どおり「削除」として
+    /// 扱う。errno だけでは分けられないので、親に到達できるかとその場所の種別で判断する。
+    fn root_volume_is_unreachable(&self, root_path: &Path) -> bool {
+        volume_of_path_is_unreachable(self.fs.as_ref(), root_path)
     }
 
     async fn process_events(&self, mut events: Vec<PathEvent>) {

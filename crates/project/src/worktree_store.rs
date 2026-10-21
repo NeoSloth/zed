@@ -995,6 +995,10 @@ impl WorktreeStore {
                     // The worktree root itself has been deleted (for single-file worktrees)
                     // The worktree will be removed via the observe_release callback
                 }
+                worktree::Event::RootUnavailable | worktree::Event::RootAvailable => {
+                    // root を含む volume が到達できない/戻った状態で、worktree は閉じない。
+                    // 開いているバッファの扱いは `LocalBufferStore` が worktree を直接購読して決める。
+                }
                 worktree::Event::UpdatedRootRepoCommonDir { .. } => {
                     cx.emit(WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(
                         worktree_id,

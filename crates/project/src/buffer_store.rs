@@ -455,13 +455,71 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) {
         cx.subscribe(worktree, |this, worktree, event, cx| {
-            if worktree.read(cx).is_local()
-                && let worktree::Event::UpdatedEntries(changes) = event
-            {
-                Self::local_worktree_entries_changed(this, &worktree, changes, cx);
+            if !worktree.read(cx).is_local() {
+                return;
+            }
+            match event {
+                worktree::Event::UpdatedEntries(changes) => {
+                    Self::local_worktree_entries_changed(this, &worktree, changes, cx);
+                }
+                // root の entry は snapshot の diff に現れない（`build_diff` は root を飛ばす）ので、
+                // volume が消えた・戻ったことは worktree の状態から直接バッファに写す。
+                worktree::Event::RootUnavailable | worktree::Event::RootAvailable => {
+                    Self::local_worktree_root_availability_changed(this, &worktree, cx);
+                }
+                _ => {}
             }
         })
         .detach();
+    }
+
+    /// root を含む volume が到達できない/再び到達できることを、開いているバッファの `File` に写す。
+    ///
+    /// 到達できない間は「ディスク上に無い」ファイルとして扱うので、空の内容で共有を覆ってしまう
+    /// 保存を防げる。戻った時は snapshot の各パスの entry を読み直すことで
+    /// `Buffer::file_updated` が `ReloadNeeded` を出し、ディスク上の内容が正になる。
+    fn local_worktree_root_availability_changed(
+        this: &mut BufferStore,
+        worktree_handle: &Entity<Worktree>,
+        cx: &mut Context<BufferStore>,
+    ) {
+        let worktree_id = worktree_handle.read(cx).id();
+        let unavailable = worktree_handle.read(cx).root_unavailable();
+        let snapshot = worktree_handle.read(cx).snapshot();
+
+        let buffers = this
+            .opened_buffers
+            .values()
+            .filter_map(OpenBuffer::upgrade)
+            .collect::<Vec<_>>();
+
+        for buffer in buffers {
+            buffer.update(cx, |buffer, cx| {
+                let Some(old_file) = File::from_dyn(buffer.file()) else {
+                    return;
+                };
+                if old_file.worktree_id(cx) != worktree_id {
+                    return;
+                }
+
+                // 本文はそのままで状態だけ書き換える。entry が無い場合は、その場所が
+                // まだ到達できないままだと読む。
+                let entry = if unavailable {
+                    None
+                } else {
+                    snapshot.entry_for_path(old_file.path()).cloned()
+                };
+                let new_file = match entry {
+                    Some(entry) => File::for_entry(entry, worktree_handle.clone()),
+                    None => Arc::new(File {
+                        disk_state: DiskState::Deleted,
+                        ..old_file.clone()
+                    }),
+                };
+
+                buffer.file_updated(new_file, cx);
+            });
+        }
     }
 
     fn local_worktree_entries_changed(
@@ -717,7 +775,17 @@ impl LocalBufferStore {
                         buffer
                     })
                 }
-                Err(error) if is_not_found_error(&error) => cx.new(|cx| {
+                Err(error) if is_not_found_error(&error) => {
+                    // 到達できない volume の上では、ファイルが消えたのか共有が戻るのを待って
+                    // いるのかを区別できない。新規の空ファイルとして扱うと、そのまま保存して
+                    // 共有側を空で覆ってしまう。削除済みとして扱う。
+                    let disk_state = if worktree.read_with(cx, |worktree, _| worktree.root_unavailable())
+                    {
+                        DiskState::Deleted
+                    } else {
+                        DiskState::New
+                    };
+                    cx.new(|cx| {
                     let buffer_id = BufferId::from(cx.entity_id().as_non_zero_u64());
                     let text_buffer = text::Buffer::new(ReplicaId::LOCAL, buffer_id, "");
                     let mut buffer = Buffer::build(
@@ -725,7 +793,7 @@ impl LocalBufferStore {
                         Some(Arc::new(File {
                             worktree,
                             path,
-                            disk_state: DiskState::New,
+                            disk_state,
                             entry_id: None,
                             is_local: true,
                             is_private: false,
@@ -735,7 +803,8 @@ impl LocalBufferStore {
                     );
                     apply_initial_line_ending(&mut buffer, cx);
                     buffer
-                }),
+                    })
+                }
                 Err(e) => return Err(e),
             };
             this.update(cx, |this, cx| {
@@ -843,8 +912,17 @@ impl BufferStore {
                 worktree_store: worktree_store.clone(),
                 _subscription: cx.subscribe(&worktree_store, |this, _, event, cx| {
                     if let WorktreeStoreEvent::WorktreeAdded(worktree) = event {
-                        let this = this.as_local_mut().unwrap();
-                        this.subscribe_to_worktree(worktree, cx);
+                        // 起動時に volume へ到達できない worktree では `RootUnavailable` がこの
+                        // 購読より前に発行済みなので、現在の状態から直接適用する。
+                        let root_unavailable = worktree.read(cx).root_unavailable();
+                        if let Some(local) = this.as_local_mut() {
+                            local.subscribe_to_worktree(worktree, cx);
+                            if root_unavailable {
+                                LocalBufferStore::local_worktree_root_availability_changed(
+                                    this, worktree, cx,
+                                );
+                            }
+                        }
                     }
                 }),
             }),

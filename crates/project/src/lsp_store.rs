@@ -5103,6 +5103,10 @@ impl LspStore {
                     worktree::Event::UpdatedGitRepositories(_)
                     | worktree::Event::DeletedEntry(_)
                     | worktree::Event::Deleted
+                    // root を含む volume が消えた/戻った場合は worktree 自体が生きたままなので、
+                    // 言語サーバーの停止・再開は worktree の復旧処理に任せる。
+                    | worktree::Event::RootUnavailable
+                    | worktree::Event::RootAvailable
                     | worktree::Event::UpdatedRootRepoCommonDir { .. } => {}
                 })
                 .detach()

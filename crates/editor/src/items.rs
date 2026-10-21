@@ -805,6 +805,22 @@ impl Item for Editor {
             .and_then(|buffer| buffer.read(cx).file())
             .is_some_and(|file| file.disk_state().is_deleted());
 
+        // 共有ごと到達できない間はバッファとタブを生かし続けるので、その状態を ✕ で示す。
+        // 実際に削除された場合とは区別したい（復帰後は共有の内容が正になるため）。
+        let volume_unavailable = self
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| {
+                let project_path = buffer.read(cx).project_path(cx)?;
+                let worktree = self
+                    .project()?
+                    .read(cx)
+                    .worktree_for_id(project_path.worktree_id, cx)?;
+                Some(worktree.read(cx).root_unavailable())
+            })
+            .unwrap_or(false);
+
         h_flex()
             .gap_1()
             .when(!params.selected, |tab| tab.track_focus(&self.focus_handle))
@@ -826,7 +842,7 @@ impl Item for Editor {
                     this.truncate_middle().flex_1()
                 })
                 .when(params.preview, |this| this.italic())
-                .when(was_deleted, |this| this.strikethrough()),
+                .when(was_deleted || volume_unavailable, |this| this.strikethrough()),
             )
             .when_some(description, |this, description| {
                 this.child(
@@ -837,6 +853,13 @@ impl Item for Editor {
                             this.truncate_start().flex_shrink()
                         })
                         .color(Color::Muted),
+                )
+            })
+            .when(volume_unavailable, |this| {
+                this.child(
+                    Icon::new(IconName::XCircle)
+                        .color(Color::Error)
+                        .size(IconSize::XSmall),
                 )
             })
             .into_any_element()
@@ -1507,6 +1530,12 @@ impl SerializableItem for Editor {
         });
 
         let is_dirty = buffer.read(cx).is_dirty();
+        // 削除された・共有ごと到達できないファイルは、次に Zed を開いた時にディスクから読めない。
+        // 本文を保つにはここに保存しておくしかない（ディスクにある通常のファイルは読ませる）。
+        let file_absent_from_disk = buffer
+            .read(cx)
+            .file()
+            .is_some_and(|file| file.disk_state().is_deleted());
         let mtime = buffer.read(cx).saved_mtime();
         let content_language_detection_enabled =
             buffer.read(cx).content_language_detection_enabled();
@@ -1515,7 +1544,7 @@ impl SerializableItem for Editor {
 
         let db = EditorDb::global(cx);
         Some(cx.background_spawn(async move {
-            let (contents, language) = if serialize_dirty_buffers && is_dirty {
+            let (contents, language) = if serialize_dirty_buffers && (is_dirty || file_absent_from_disk) {
                 let contents = snapshot.text();
                 let language = snapshot.language().and_then(|language| {
                     if content_language_detection_enabled && *language == *PLAIN_TEXT {

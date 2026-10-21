@@ -196,6 +196,24 @@ pub struct SettingsContent {
     /// Settings related to the file finder.
     pub file_finder: Option<FileFinderSettingsContent>,
 
+    /// Chooses how Zed detects file changes:
+    /// - `true`: always poll for file changes
+    /// - `false`: always use the operating system's file watcher
+    /// - unset: follow the filesystem-type auto-detection, which `ZED_FILE_WATCHER_MODE` can also override
+    ///
+    /// Settings files take precedence over that environment variable, so leaving this setting unset keeps the existing behavior.
+    /// How often polling runs is controlled by `file_watcher_poll_ms`.
+    ///
+    /// Default: unset
+    pub file_watcher_use_polling: Option<bool>,
+
+    /// How often polling checks for file changes, in milliseconds. Values outside the range 500 to 30000 are clamped.
+    /// This setting takes precedence over the `ZED_FILE_WATCHER_POLL_MS` environment variable.
+    /// The interval is read when the polling watcher starts, so restart Zed after changing it.
+    ///
+    /// Default: 2000
+    pub file_watcher_poll_ms: Option<u64>,
+
     pub call_hierarchy: Option<CallHierarchySettingsContent>,
 
     pub git_panel: Option<GitPanelSettingsContent>,
@@ -404,7 +422,8 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+        call_hierarchy, command_palette, file_finder, file_watcher_poll_ms, file_watcher_use_polling,
+        git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,

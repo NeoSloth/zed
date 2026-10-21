@@ -100,6 +100,32 @@ impl From<PathEvent> for PathBuf {
     }
 }
 
+/// ファイル監視にポーリングを使うかどうかの強制指定。
+///
+/// `file_watcher_use_polling` 設定から変換される。`Auto` は環境変数
+/// `ZED_FILE_WATCHER_MODE` とファイルシステム種の自動判定に委ねることを意味する。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileWatchMode {
+    /// 設定による指定はない。環境変数と自動判定にフォールバックする。
+    #[default]
+    Auto,
+    /// 常にポーリングで監視する。
+    Poll,
+    /// 常に OS 標準のファイルウォッチャーで監視する。
+    Native,
+}
+
+impl FileWatchMode {
+    /// 設定ファイルの `file_watcher_use_polling` の値を監視方式に変換する。
+    pub fn from_use_polling(use_polling: Option<bool>) -> Self {
+        match use_polling {
+            Some(true) => Self::Poll,
+            Some(false) => Self::Native,
+            None => Self::Auto,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Fs: Send + Sync {
     async fn create_dir(&self, path: &Path) -> Result<()>;
@@ -171,6 +197,23 @@ pub trait Fs: Send + Sync {
     /// Whether `path` sits on a filesystem where native file watching does not
     /// deliver events (network mounts, some FUSE and WSL mounts), so it must be polled.
     fn requires_poll_watcher(&self, path: &Path) -> bool;
+
+    /// その場所がネットワーク共有（SMB/NFS/AFP/WebDAV）や FUSE 上にあるか。
+    ///
+    /// 監視方式の指定ではなくボリュームそのものの性質を問う質問なので、
+    /// `requires_poll_watcher` とは別に扱う。マウントが解けた直後は `path` 自体に
+    /// 到達できないため、到達できる祖先を見て判定する。
+    fn is_on_network_volume(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// 設定ファイルで指定された監視方式を受け取る。
+    /// 監視する場所を持たない実装では何もしない。
+    fn set_file_watch_mode(&self, _mode: FileWatchMode) {}
+
+    /// `file_watcher_poll_ms` 設定でポーリング間隔を指定する。`None` は既定値に戻す。
+    /// 監視する場所を持たない実装では何もしない。
+    fn set_file_watch_poll_ms(&self, _poll_ms: Option<u64>) {}
 
     async fn watch(
         &self,
@@ -463,6 +506,7 @@ pub struct RealFs {
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Arc<Mutex<SlotMap<TrashId, TrashedEntry>>>,
     is_case_sensitive: AtomicU8,
+    file_watch_mode: Mutex<FileWatchMode>,
 }
 
 pub trait FileHandle: Send + Sync + std::fmt::Debug {
@@ -581,6 +625,7 @@ impl RealFs {
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
             trash: Arc::new(Mutex::new(SlotMap::with_key())),
             is_case_sensitive: Default::default(),
+            file_watch_mode: Mutex::new(FileWatchMode::default()),
         })
     }
 
@@ -1202,7 +1247,24 @@ impl Fs for RealFs {
     }
 
     fn requires_poll_watcher(&self, path: &Path) -> bool {
-        fs_watcher::requires_poll_watcher(path)
+        // 設定ファイルの値は環境変数より優先される。未設定の時だけ自動判定に委ねる。
+        match *self.file_watch_mode.lock() {
+            FileWatchMode::Poll => true,
+            FileWatchMode::Native => false,
+            FileWatchMode::Auto => fs_watcher::requires_poll_watcher(path),
+        }
+    }
+
+    fn is_on_network_volume(&self, path: &Path) -> bool {
+        fs_watcher::is_on_network_volume(self, path)
+    }
+
+    fn set_file_watch_mode(&self, mode: FileWatchMode) {
+        *self.file_watch_mode.lock() = mode;
+    }
+
+    fn set_file_watch_poll_ms(&self, poll_ms: Option<u64>) {
+        self.poll_watcher.set_poll_interval(poll_ms);
     }
 
     async fn watch(
@@ -1467,6 +1529,7 @@ struct FakeFsState {
     trash: Mutex<SlotMap<TrashId, (TrashedEntry, FakeFsEntry)>>,
     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
     case_sensitive: bool,
+    network_volume_prefixes: Vec<PathBuf>,
 }
 
 /// The kernel's side of file watching, as far as the real watcher code above
@@ -1862,6 +1925,7 @@ impl FakeFs {
             trash: Mutex::new(SlotMap::with_key()),
             remove_dir_errors: Default::default(),
             case_sensitive: true,
+            network_volume_prefixes: Vec::new(),
         }));
         let native_watcher = fs_watcher::OsWatcher::with_backend(
             fs_watcher::OsWatcherKind::Native,
@@ -1901,6 +1965,17 @@ impl FakeFs {
     /// Configures whether the fake filesystem reports as case-sensitive.
     pub fn set_case_sensitive(&self, case_sensitive: bool) {
         self.state.lock().case_sensitive = case_sensitive;
+    }
+
+    /// 指定した接頭辞の配下をネットワークボリュームとして扱う。
+    ///
+    /// worktree は「ボリュームごと到達できない」と「ファイルが削除された」を分岐させるために
+    /// volume の種別を必要とする。フェイク filesystem では実際にマウントを解かずにその状態を作る。
+    pub fn set_network_volume_prefixes(&self, prefixes: impl IntoIterator<Item = impl AsRef<Path>>) {
+        self.state.lock().network_volume_prefixes = prefixes
+            .into_iter()
+            .map(|prefix| normalize_path(prefix.as_ref()))
+            .collect();
     }
 
     pub fn set_next_mtime(&self, next_mtime: SystemTime) {
@@ -3499,6 +3574,15 @@ impl Fs for FakeFs {
 
     fn requires_poll_watcher(&self, _path: &Path) -> bool {
         false
+    }
+
+    fn is_on_network_volume(&self, path: &Path) -> bool {
+        let path = normalize_path(path);
+        let state = self.state.lock();
+        state
+            .network_volume_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
     }
 
     fn is_fake(&self) -> bool {

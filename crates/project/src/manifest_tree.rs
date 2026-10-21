@@ -59,7 +59,12 @@ impl WorktreeRoots {
                         let path = TriePath::from(entry.path.as_ref());
                         this.roots.remove(&path);
                     }
-                    WorktreeEvent::Deleted | WorktreeEvent::UpdatedRootRepoCommonDir { .. } => {}
+                    // root を含む volume が消えた場合も manifest の root 自体は有効なまま
+                    // 残す（復旧後に通常の UpdatedEntries で更新される）。
+                    WorktreeEvent::RootUnavailable
+                    | WorktreeEvent::RootAvailable
+                    | WorktreeEvent::Deleted
+                    | WorktreeEvent::UpdatedRootRepoCommonDir { .. } => {}
                 }
             }),
         })

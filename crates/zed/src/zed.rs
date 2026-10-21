@@ -438,6 +438,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
     init_cursor_hide_mode(cx);
     init_app_appearance(cx);
     init_reduce_motion(cx);
+    // worktree が watcher を登録する前に監視方式と間隔を決めておく必要がある。
+    init_file_watcher_settings(app_state.fs.clone(), cx);
     init_global_config_error_notifications(cx);
 
     cx.observe_new(|_multi_workspace: &mut MultiWorkspace, window, cx| {
@@ -2076,6 +2078,23 @@ fn init_reduce_motion(cx: &mut App) {
     let apply = |cx: &mut App| {
         let reduce_motion = ReduceMotionSetting::get_global(cx).0 == settings::ReduceMotionMode::On;
         cx.set_reduce_motion(reduce_motion);
+    };
+    apply(cx);
+    cx.observe_global::<SettingsStore>(apply).detach();
+}
+
+/// `file_watcher_use_polling` と `file_watcher_poll_ms` 設定を `fs` に反映する。
+///
+/// 監視方式はウォッチ登録時に、ポーリング間隔はポーリング用バックエンドの生成時に決まるため、
+/// 稼働中の変更が効くのはプロジェクトを開き直した時、または Zed の再起動時になる。
+fn init_file_watcher_settings(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+    let apply = move |cx: &mut App| {
+        let settings = SettingsStore::global(cx).merged_settings();
+        // 未設定の時だけ `fs` 側が環境変数と自動判定にフォールバックする。
+        fs.set_file_watch_mode(fs::FileWatchMode::from_use_polling(
+            settings.file_watcher_use_polling,
+        ));
+        fs.set_file_watch_poll_ms(settings.file_watcher_poll_ms);
     };
     apply(cx);
     cx.observe_global::<SettingsStore>(apply).detach();
@@ -7678,6 +7697,139 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_last_session_falls_back_to_last_workspace_when_session_id_is_orphaned(
+        cx: &mut TestAppContext,
+    ) {
+        use session::Session;
+        use workspace::{OpenMode, Workspace};
+
+        let app_state = init_test(cx);
+
+        let restored_dir = path!("/dir_opened_in_first_session");
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(restored_dir, json!({}))
+            .await;
+
+        // 最初のセッションでワークスペースを開き、レコードをデータベースへ保存する。
+        let workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![restored_dir.into()],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to open workspace");
+        cx.run_until_parked();
+        flush_workspace_serialization(&window, cx).await;
+
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        // 二重起動したインスタンスが保存済みのセッション ID を置き換えた状態を再現する。
+        // 更新後の再起動ではこのせいで直近セッションのワークスペースが見つからない。
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _cx| {
+                app_session.replace_session_for_test(Session::test_with_old_session(
+                    "replaced-by-second-instance".to_string(),
+                ));
+            });
+        });
+
+        let mut async_cx = cx.to_async();
+        let locations = crate::restorable_workspace_locations(&mut async_cx, &app_state)
+            .await
+            .expect("an orphaned session id must fall back to the last opened workspace");
+        assert_eq!(
+            locations.len(),
+            1,
+            "expected the last opened workspace to be restored, got {locations:?}"
+        );
+        assert!(
+            locations[0]
+                .paths
+                .paths()
+                .iter()
+                .any(|path| path.as_path() == Path::new(restored_dir)),
+            "expected {restored_dir} to be restored, got {:?}",
+            locations[0].paths.paths()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restore_on_startup_disabled_does_not_fall_back_to_last_workspace(
+        cx: &mut TestAppContext,
+    ) {
+        use session::Session;
+        use workspace::{self, OpenMode, Workspace};
+
+        let app_state = init_test(cx);
+
+        // 復元を無効にしている利用者が、退避のせいで勝手にプロジェクトを開かないことを確認する。
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.restore_on_startup =
+                        Some(workspace::RestoreOnStartupBehavior::EmptyTab);
+                });
+            });
+        });
+
+        let kept_dir = path!("/dir_with_restoration_disabled");
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(kept_dir, json!({}))
+            .await;
+
+        let workspace::OpenResult { window, .. } = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![kept_dir.into()],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to open workspace");
+        cx.run_until_parked();
+        flush_workspace_serialization(&window, cx).await;
+
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _cx| {
+                app_session.replace_session_for_test(Session::test_with_old_session(
+                    "replaced-by-second-instance".to_string(),
+                ));
+            });
+        });
+
+        let mut async_cx = cx.to_async();
+        let locations = crate::restorable_workspace_locations(&mut async_cx, &app_state).await;
+        assert!(
+            locations.is_none(),
+            "disabling restoration must not fall back to the last workspace, got {locations:?}"
+        );
     }
 
     #[gpui::test]

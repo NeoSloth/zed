@@ -2254,6 +2254,13 @@ impl Pane {
 
         const DELETED_MESSAGE: &str = "This file has been deleted on disk since you started editing it. Do you want to recreate it?";
 
+        // 到達できない共有の上では書き込みそのものが失敗する。ここで「削除された」と伝えても
+        // 誤解になるので、接続が切れていることをそのまま伝える。
+        const DISCONNECTED_SHARE_MESSAGE: &str =
+            "The network share holding this file is disconnected. Do you want to try saving it anyway?";
+        const DISCONNECTED_SHARE_DETAIL: &str =
+            "Zed will read the file again when the share is connected.";
+
         let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
         if save_intent == SaveIntent::Skip {
             let is_saveable_singleton = cx.update(|_window, cx| {
@@ -2285,7 +2292,9 @@ impl Pane {
             can_save_as,
             is_singleton,
             has_deleted_file,
+            share_disconnected,
         ) = cx.update(|_window, cx| {
+            let project_path = item.project_path(cx);
             (
                 item.has_conflict(cx),
                 item.is_dirty(cx),
@@ -2293,6 +2302,12 @@ impl Pane {
                 item.can_save_as(cx),
                 item.buffer_kind(cx) == ItemBufferKind::Singleton,
                 item.has_deleted_file(cx),
+                project_path.is_some_and(|project_path| {
+                    project
+                        .read(cx)
+                        .worktree_for_id(project_path.worktree_id, cx)
+                        .is_some_and(|worktree| worktree.read(cx).root_unavailable())
+                }),
             )
         })?;
 
@@ -2316,6 +2331,32 @@ impl Pane {
 
         let should_format = save_intent != SaveIntent::SaveWithoutFormat;
         let force_format = save_intent == SaveIntent::FormatAndSave;
+
+        // 到達できない共有への保存は失敗するので、まずその旨を伝える。共有が戻ると Zed が
+        // 読み直すので、ここで保存を試る必要はない。明示的な保存操作にだけ応じる。
+        if share_disconnected
+            && is_singleton
+            && can_save
+            && matches!(
+                save_intent,
+                SaveIntent::Save | SaveIntent::FormatAndSave | SaveIntent::SaveWithoutFormat
+            )
+        {
+            let answer = pane.update_in(cx, |pane, window, cx| {
+                pane.activate_item(item_ix, true, true, window, cx);
+                window.prompt(
+                    PromptLevel::Warning,
+                    DISCONNECTED_SHARE_MESSAGE,
+                    Some(DISCONNECTED_SHARE_DETAIL),
+                    &["Save", "Cancel"],
+                    cx,
+                )
+            })?;
+            match answer.await {
+                Ok(0) => {}
+                _ => return Ok(false),
+            }
+        }
 
         if has_conflict && can_save {
             if has_deleted_file && is_singleton {

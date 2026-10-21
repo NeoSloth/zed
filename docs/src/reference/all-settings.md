@@ -2493,6 +2493,34 @@ In multi-folder projects, depth is measured from each root folder separately.
 
 When set to `expanded`, symbolic links are only scanned after you explicitly expand them in the project panel. When set to `always`, Zed follows all symbolic links and scans their contents when indexing the project, unless they match gitignore rules. The `always` option may have performance implications for projects with many or deeply nested symlinks.
 
+## File Watcher Polling
+
+- Setting: `file_watcher_use_polling`
+- Description: Whether Zed polls for file changes instead of using the operating system's file watcher. This setting takes precedence over the `ZED_FILE_WATCHER_MODE` environment variable.
+- Default: unset, which lets Zed choose based on the filesystem type
+
+```json [settings]
+{
+  "file_watcher_use_polling": true
+}
+```
+
+Use `false` to always use the native OS watcher, or remove the key to go back to automatic detection. Automatic detection inspects the volume a path sits on: network shares (SMB, NFS, CIFS, AFP, WebDAV), FUSE mounts and 9P/WSL drvfs mounts are polled, while local disks keep native watching. Watchers are registered when a project is opened, so a change applies to projects you open after saving this setting.
+
+## File Watcher Poll Interval
+
+- Setting: `file_watcher_poll_ms`
+- Description: How often polling checks for file changes, in milliseconds. Values outside the range 500 to 30000 are clamped. This setting takes precedence over the `ZED_FILE_WATCHER_POLL_MS` environment variable.
+- Default: 2000
+
+```json [settings]
+{
+  "file_watcher_poll_ms": 500
+}
+```
+
+Shorter intervals notice changes sooner but re-scan watched directories more often, so large projects cost more CPU and disk I/O. The interval is read when the polling watcher starts, so restart Zed after changing it.
+
 ## File Types
 
 - Setting: `file_types`
@@ -4071,6 +4099,8 @@ List of strings containing any combination of:
   "restore_on_startup": "last_session"
 }
 ```
+
+When the workspaces saved for the last session cannot be found, for example because another Zed instance replaced the saved session id while this one was launching, Zed falls back to restoring the last opened workspace instead of opening an empty window.
 
 2. Restore the workspace that was closed last:
 

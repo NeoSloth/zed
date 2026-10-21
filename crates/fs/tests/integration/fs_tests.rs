@@ -522,6 +522,55 @@ async fn test_realfs_canonicalize(executor: BackgroundExecutor) {
     assert!(canonicalized.is_ok());
 }
 
+/// `file_watcher_use_polling` 設定が環境変数より優先されることを確認する。
+#[gpui::test]
+async fn test_realfs_file_watch_mode_override(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path();
+
+    // 設定ファイルの true / false / 未設定がどの監視方式に対応するか。
+    assert_eq!(
+        FileWatchMode::from_use_polling(Some(true)),
+        FileWatchMode::Poll
+    );
+    assert_eq!(
+        FileWatchMode::from_use_polling(Some(false)),
+        FileWatchMode::Native
+    );
+    assert_eq!(FileWatchMode::from_use_polling(None), FileWatchMode::Auto);
+
+    fs.set_file_watch_mode(FileWatchMode::Poll);
+    assert!(fs.requires_poll_watcher(path));
+
+    fs.set_file_watch_mode(FileWatchMode::Native);
+    assert!(!fs.requires_poll_watcher(path));
+
+    // 未設定に戻した時は自動判定と同じ結果になる。
+    fs.set_file_watch_mode(FileWatchMode::Auto);
+    assert_eq!(
+        fs.requires_poll_watcher(path),
+        fs_watcher::requires_poll_watcher(path)
+    );
+}
+
+/// ローカル volume はネットワークボリュームとして扱わず、マウント置き場の形だけを
+/// 到達できない volume として扱うことを確認する。
+#[gpui::test]
+async fn test_realfs_network_volume_detection(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+
+    // statfs できる場所なので、種別で「ローカル」と分かる。
+    assert!(!fs.is_on_network_volume(temp_dir.path()));
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // マウントが解けた共有はこの形になる。stat できないので、場所の形で判断する。
+        assert!(fs.is_on_network_volume(Path::new("/Volumes/zed-test-share/file.txt")));
+    }
+}
+
 #[gpui::test]
 async fn test_rename(executor: BackgroundExecutor) {
     let fs = FakeFs::new(executor.clone());

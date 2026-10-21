@@ -4145,6 +4145,41 @@ fn search_and_files_page() -> SettingsPage {
         ]
     }
 
+    // ファイルスキャンとファイル監視は別の動作なので、監視専用のセクションにする。
+    fn file_watching_section() -> [SettingsPageItem; 3] {
+        [
+            SettingsPageItem::SectionHeader("File Watching"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Use Polling For File Watching",
+                description: "Whether to poll for file changes instead of using the operating system's file watcher. When unset, Zed chooses based on the filesystem, which `ZED_FILE_WATCHER_MODE` can also override. This setting takes precedence over that variable. Changes apply to projects opened after it is set.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("file_watcher_use_polling"),
+                    pick: |settings_content| settings_content.file_watcher_use_polling.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.file_watcher_use_polling = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Poll Interval",
+                description: "How often polling checks for file changes, in milliseconds. Values outside 500 to 30000 are clamped, and this setting takes precedence over `ZED_FILE_WATCHER_POLL_MS`. The interval is read when the polling watcher starts, so restart Zed after changing it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("file_watcher_poll_ms"),
+                    pick: |settings_content| settings_content.file_watcher_poll_ms.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.file_watcher_poll_ms = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     SettingsPage {
         title: "Search & Files",
         items: concat_sections![
@@ -4152,6 +4187,7 @@ fn search_and_files_page() -> SettingsPage {
             command_palette_section(),
             file_finder_section(),
             file_scan_section(),
+            file_watching_section(),
         ],
     }
 }

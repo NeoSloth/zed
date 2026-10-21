@@ -9536,6 +9536,82 @@ async fn test_dirty_buffer_reloads_after_undo(cx: &mut gpui::TestAppContext) {
     });
 }
 
+/// SMB の共有ごと到達できなくなった時に、開いているバッファの本文を保ち、共有が戻ったら
+/// ディスク上の内容を正にすることを確認する。
+#[gpui::test]
+async fn test_buffer_waits_with_its_network_volume_and_rereads_it(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
+    fs.insert_tree(
+        path!("/Volumes/Home"),
+        json!({
+            "notes.txt": "content on the share",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/Volumes/Home/notes.txt").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/Volumes/Home/notes.txt"), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "content on the share");
+        assert!(!buffer.is_dirty());
+    });
+
+    // 共有ごと消える（スリープで SMB のマウントが解れたのと同じ）。
+    fs.pause_events();
+    fs.remove_file(path!("/Volumes/Home/notes.txt").as_ref(), Default::default())
+        .await
+        .unwrap();
+    fs.remove_dir(path!("/Volumes/Home").as_ref(), Default::default())
+        .await
+        .unwrap();
+    fs.unpause_events_and_flush();
+    cx.run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "content on the share",
+            "共有に到達できない間も本文はそのまま保つ"
+        );
+        assert!(
+            buffer.file().unwrap().disk_state().is_deleted(),
+            "ディスク上に見えないファイルとして扱う"
+        );
+    });
+
+    // 共有が戻った。その中のファイルが変わっていれば、そちらを正にする。
+    fs.insert_tree(
+        path!("/Volumes/Home"),
+        json!({
+            "notes.txt": "content written while we were away",
+        }),
+    )
+    .await;
+    // 復旧を確認する間隔（2 秒）を超える分を進める。
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.run_until_parked();
+
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(
+            buffer.text(),
+            "content written while we were away",
+            "共有が戻ったらディスクの内容を正にする"
+        );
+        assert!(!buffer.is_dirty(), "ユーザーが編集していないので dirty にはしない");
+    });
+}
+
 #[gpui::test]
 async fn test_buffer_file_change_to_binary_fails(cx: &mut gpui::TestAppContext) {
     init_test(cx);

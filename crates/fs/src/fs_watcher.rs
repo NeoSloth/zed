@@ -7,7 +7,10 @@ use std::{
     ops::DerefMut,
     path::Path,
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use util::{ResultExt, paths::SanitizedPath};
@@ -284,11 +287,17 @@ fn path_covered_by_recursive_registration(
 ///
 /// Returns `true` for filesystem types where inotify/FSEvents/ReadDirectoryChanges
 /// silently fail to deliver events: 9P (WSL drvfs), NFS, CIFS/SMB, FUSE (sshfs), etc.
+/// Detection runs on Linux (statfs magic), macOS (statfs `f_fstypename`) and Windows
+/// (`GetDriveTypeW` reporting a remote volume); other platforms keep native watching.
 ///
 /// Can be overridden with the `ZED_FILE_WATCHER_MODE` environment variable:
 /// - `native` — always use native OS watcher
 /// - `poll` — always use polling
 /// - `auto` (default) — auto-detect based on filesystem type
+///
+/// Settings given through `file_watcher_use_polling` take precedence over this
+/// variable, so `RealFs` holds them as a `FileWatchMode` and only calls this
+/// function when the setting is unset.
 pub fn requires_poll_watcher(path: &Path) -> bool {
     match std::env::var("ZED_FILE_WATCHER_MODE")
         .as_deref()
@@ -299,16 +308,167 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
         _ => {}
     }
 
+    detect_requires_poll_watcher(path)
+}
+
+/// 設定や環境変数を見ずに、その場所がネットワーク共有・FUSE 上かを判定する。
+///
+/// 「監視に poll が必要か」と「そもそもネットワークボリュームか」は同じ OS 情報から分かるが、
+/// worktree は後者だけを必要とする。前者は設定で上書きされるので、切断の判定に使うと
+/// `file_watcher_use_polling: true` の利用者のローカルファイルまで影響してしまう。
+fn detect_requires_poll_watcher(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return detect_requires_poll_watcher_linux(path);
+        detect_requires_poll_watcher_linux(path)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        detect_requires_poll_watcher_macos(path)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        detect_requires_poll_watcher_windows(path)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = path;
         false
     }
+}
+
+/// ネットワーク共有や automount が置かれる場所。これらの下のパスが到達できないときは、
+/// ファイルが消えたと受け取るより、ボリュームごと消えたと受け取る方が正しい。
+/// macOS は /Volumes と /net、Linux の automounter は /mnt・/media・/net を使う。
+#[cfg(not(target_os = "windows"))]
+const NETWORK_MOUNT_PARENTS: [&str; 4] = ["/Volumes", "/net", "/mnt", "/media"];
+
+/// UNC 共有の区切り。Windows では `\\host\share` の形でネットワーク共有を指す。
+#[cfg(target_os = "windows")]
+const UNC_PATH_PREFIX: &str = r"\\";
+
+/// その場所がネットワーク共有・FUSE マウント上にあるかを調べる。
+///
+/// SMB のマウントが解けると volume の配下は statfs すら失敗する。macOS では未マウントの
+/// 起動時に ENOENT、スリープ明けに ENOTCONN が出るため、errno だけでは「ボリュームが消えた」
+/// と「ファイルが削除された」を区別できない。到達できる場所を辿って volume の種別で見分け、
+/// 到達できる場所が一つもない場合はマウント置き場の形で見分ける。
+pub fn is_on_network_volume(fs: &dyn Fs, path: &Path) -> bool {
+    if is_expected_network_mount_path(path) {
+        return true;
+    }
+
+    let mut candidate = path;
+    loop {
+        if detect_requires_poll_watcher(candidate) {
+            return true;
+        }
+        // 到達できるのにネットワーク由来ではないなら、それより下流もローカルだと分かる。
+        if fs.path_exists(candidate) {
+            return false;
+        }
+        let Some(parent) = candidate.parent() else {
+            return false;
+        };
+        candidate = parent;
+    }
+}
+
+/// マウント置き場に置かれた形のパスか。到達できない場所の判別に使う。
+fn is_expected_network_mount_path(path: &Path) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        NETWORK_MOUNT_PARENTS
+            .iter()
+            .any(|mount_parent| path.starts_with(mount_parent))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        path.starts_with(UNC_PATH_PREFIX)
+    }
+}
+
+/// `GetDriveTypeW` that returns this value is reporting a mapped network drive or a
+/// UNC share, where ReadDirectoryChangesW does not reliably deliver events.
+#[cfg(target_os = "windows")]
+const WINDOWS_DRIVE_REMOTE: u32 = 4;
+
+/// Whether a mounted volume's filesystem name belongs to a network or FUSE share,
+/// where FSEvents silently fails to deliver events. macOS reports FUSE mounts as
+/// `fuse_<name>`, so those are matched by prefix.
+#[cfg(target_os = "macos")]
+fn file_system_name_requires_polling(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("fuse")
+        || ["afpfs", "cifs", "nfs", "smb", "smbfs", "webdav"]
+            .iter()
+            .any(|network_name| name == *network_name)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_requires_poll_watcher_macos(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // statfs is called on paths Zed already resolved, so a failure just means we
+    // cannot classify the volume and keep the existing native behavior.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+
+    let file_system_name = nul_terminated_bytes_to_string(&stat.f_fstypename);
+    if file_system_name_requires_polling(&file_system_name) {
+        log::info!(
+            "Detected network filesystem \"{}\" at {}, using poll watcher",
+            file_system_name,
+            path.display()
+        );
+        return true;
+    }
+
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn detect_requires_poll_watcher_windows(path: &Path) -> bool {
+    use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+    use windows::core::{HSTRING, PCWSTR};
+
+    let path_hstring = HSTRING::from(path.as_os_str());
+    // GetVolumePathNameW は終端の NUL を書くので、このバッファはそのまま PCWSTR として渡せる。
+    let mut volume_buf = vec![0u16; path.as_os_str().len() + 2];
+    if unsafe { GetVolumePathNameW(&path_hstring, &mut volume_buf) }.is_err() {
+        return false;
+    }
+
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR::from_raw(volume_buf.as_ptr())) };
+    if drive_type == WINDOWS_DRIVE_REMOTE {
+        log::info!(
+            "Detected network volume (drive type {drive_type}) for {}, using poll watcher",
+            path.display()
+        );
+        return true;
+    }
+
+    false
+}
+
+/// C 固定長配列の NUL 打ち切り済みバイト列を String に変換する（ファイルシステム名の比較用）。
+#[cfg(target_os = "macos")]
+fn nul_terminated_bytes_to_string(values: &[std::ffi::c_char]) -> String {
+    let bytes: Vec<u8> = values
+        .iter()
+        .take_while(|value| **value != 0)
+        .map(|value| *value as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn register_existing_path(
@@ -323,7 +483,7 @@ fn register_existing_path(
     let os_watcher = if fs.requires_poll_watcher(path.as_ref()) {
         log::info!(
             "Using poll watcher ({}ms interval) for {}",
-            poll_interval().as_millis(),
+            poll_watcher.poll_interval().as_millis(),
             path.display()
         );
         telemetry::event!("fs_watcher_poll", path = path.display().to_string());
@@ -591,7 +751,7 @@ async fn poll_path_until_created(
     pending_registrations: Arc<Mutex<HashMap<Arc<Path>, Task<()>>>>,
 ) {
     loop {
-        executor.timer(poll_interval()).await;
+        executor.timer(poll_watcher.poll_interval()).await;
 
         if !pending_registrations.lock().contains_key(path.as_ref()) {
             return;
@@ -920,6 +1080,9 @@ impl<T: notify::Watcher + Send> WatchBackend for T {
 pub struct OsWatcher {
     kind: OsWatcherKind,
     recursive: bool,
+    // notify の PollWatcher は間隔をバックエンド生成時にしか読まないため、生成後の変更は
+    // Zed の再起動（バックエンド作り直し）まで反映されない。
+    poll_interval_ms: Arc<AtomicU64>,
     state: Arc<Mutex<WatcherState>>,
 
     // Hold state across backend mutations. Callbacks don't acquire state or
@@ -963,12 +1126,27 @@ impl OsWatcher {
         Arc::new(Self {
             kind,
             recursive: kind.is_recursive(),
+            poll_interval_ms: Arc::new(AtomicU64::new(*DEFAULT_POLL_INTERVAL_MILLISECONDS)),
             state,
             backend: Mutex::new(backend),
             event_tx,
             _dispatch_task: dispatch_task,
             diagnostics: Default::default(),
         })
+    }
+
+    /// 現在のポーリング間隔。ネイティブ監視のバックエンドでは使わない。
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms.load(Ordering::Relaxed))
+    }
+
+    /// `file_watcher_poll_ms` 設定でポーリング間隔を上書きする。`None` は既定値に戻す。
+    pub fn set_poll_interval(&self, poll_ms: Option<u64>) {
+        let milliseconds = match poll_ms {
+            Some(poll_ms) => clamp_poll_interval_milliseconds(poll_ms),
+            None => *DEFAULT_POLL_INTERVAL_MILLISECONDS,
+        };
+        self.poll_interval_ms.store(milliseconds, Ordering::Relaxed);
     }
 
     /// The callback a substitute backend uses to report events, standing
@@ -1208,7 +1386,7 @@ impl OsWatcher {
                     )
                 }
                 OsWatcherKind::Poll => {
-                    let config = notify::Config::default().with_poll_interval(*POLL_INTERVAL);
+                    let config = notify::Config::default().with_poll_interval(self.poll_interval());
                     Box::new(
                         notify::PollWatcher::new(self.event_sink(), config)
                             .inspect_err(|error| self.record_backend_error(error))?,
@@ -1374,14 +1552,28 @@ fn is_max_files_watch_error(error: &anyhow::Error) -> bool {
         .is_some_and(|error| matches!(&error.kind, notify::ErrorKind::MaxFilesWatch))
 }
 
-static POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
-    let poll_ms: u64 = std::env::var("ZED_FILE_WATCHER_POLL_MS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(2000)
-        .clamp(500, 30000);
-    Duration::from_millis(poll_ms)
+/// 設定も環境変もないときの既定間隔（ミリ秒）。
+const FALLBACK_POLL_INTERVAL_MILLISECONDS: u64 = 2000;
+
+/// 取りこぼしと CPU 過剰消費を防ぐため、受け付けるポーリング間隔に下限と上限を設ける。
+fn clamp_poll_interval_milliseconds(milliseconds: u64) -> u64 {
+    milliseconds.clamp(500, 30_000)
+}
+
+/// `file_watcher_poll_ms` 設定がない場合に使う既定の間隔。`ZED_FILE_WATCHER_POLL_MS` 環境変数でも決まる。
+static DEFAULT_POLL_INTERVAL_MILLISECONDS: LazyLock<u64> = LazyLock::new(|| {
+    clamp_poll_interval_milliseconds(
+        std::env::var("ZED_FILE_WATCHER_POLL_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(FALLBACK_POLL_INTERVAL_MILLISECONDS),
+    )
 });
+
+/// 設定由来の上書きがないときのポーリング間隔。
+pub fn default_poll_interval() -> Duration {
+    Duration::from_millis(*DEFAULT_POLL_INTERVAL_MILLISECONDS)
+}
 
 static NATIVE_WATCH_LIMIT_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
     let cooldown_seconds: u64 = std::env::var("ZED_NATIVE_WATCH_LIMIT_COOLDOWN_SECONDS")
@@ -1391,10 +1583,6 @@ static NATIVE_WATCH_LIMIT_COOLDOWN: LazyLock<Duration> = LazyLock::new(|| {
         .clamp(0, 300);
     Duration::from_secs(cooldown_seconds)
 });
-
-pub fn poll_interval() -> Duration {
-    *POLL_INTERVAL
-}
 
 #[cfg(test)]
 mod tests {
@@ -1413,6 +1601,104 @@ mod tests {
             path: PathBuf::from(path),
             kind: Some(PathEventKind::Changed),
         }
+    }
+
+    /// ネットワーク共有と FUSE だけをポーリング対象とし、ローカルボリュームはネイティブのままにする。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_network_file_system_names_require_polling() {
+        for name in [
+            "smbfs",
+            "SMBFS",
+            "nfs",
+            "afpfs",
+            "cifs",
+            "webdav",
+            "fuse_t",
+            "fuse_xfuse",
+        ] {
+            assert!(
+                file_system_name_requires_polling(name),
+                "{name} はネットワーク共有として扱う"
+            );
+        }
+        for name in ["apfs", "hfs", "exfat", "msdos", "ntfs", "tmpfs"] {
+            assert!(
+                !file_system_name_requires_polling(name),
+                "{name} はネイティブ監視を維持する"
+            );
+        }
+    }
+
+    /// macOS のローカルな一時ディレクトリでは自動検出がポーリングを選ばないことを確認する。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_local_macos_volume_does_not_require_poll_watcher() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        assert!(!detect_requires_poll_watcher_macos(temp_dir.path()));
+    }
+
+    /// マウント置き場の形を持つ場所だけを、到達できない時の判定に使う。
+    ///
+    /// ここを間違えると、通常のローカルファイルが消えた場合に worktree を待機状態にしてしまい、
+    /// 閉じるはずのタブが残り続ける。
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_network_mount_parents_only_match_mount_locations() {
+        for path in [
+            "/Volumes/Home/.claude/settings.json",
+            "/net/server/share/file.txt",
+            "/mnt/nas/file.txt",
+            "/media/usb/file.txt",
+        ] {
+            assert!(
+                is_expected_network_mount_path(Path::new(path)),
+                "{path} はマウント置き場として扱う"
+            );
+        }
+        for path in [
+            "/Users/me/settings.json",
+            "/VolumesPrivate/file.txt",
+            "/mnt2/file.txt",
+            "/medias/file.txt",
+        ] {
+            assert!(
+                !is_expected_network_mount_path(Path::new(path)),
+                "{path} はマウント置き場ではない"
+            );
+        }
+    }
+
+    /// Windows では UNC 共有だけをマウント置き場として扱う。ドライブ文字そのものは
+    /// 到達できる volume の種別で判断する。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_unc_paths_are_mount_locations_on_windows() {
+        assert!(is_expected_network_mount_path(Path::new(
+            r"\\server\share\file.txt"
+        )));
+        assert!(!is_expected_network_mount_path(Path::new(r"C:\Users\me\f.txt")));
+    }
+
+    /// 設定での上書きが既定値（環境変数込み）に対する優先度を持つことを確認する。
+    #[test]
+    fn test_poll_watcher_interval_override() {
+        let watcher = test_os_watcher(OsWatcherKind::Poll, None);
+
+        assert_eq!(watcher.poll_interval(), default_poll_interval());
+
+        watcher.set_poll_interval(Some(50));
+        assert_eq!(watcher.poll_interval(), Duration::from_millis(500));
+
+        watcher.set_poll_interval(Some(60_000));
+        assert_eq!(watcher.poll_interval(), Duration::from_millis(30_000));
+
+        watcher.set_poll_interval(Some(750));
+        assert_eq!(watcher.poll_interval(), Duration::from_millis(750));
+
+        // 未設定に戻すと環境変数込みの既定値へ戻る。
+        watcher.set_poll_interval(None);
+        assert_eq!(watcher.poll_interval(), default_poll_interval());
     }
 
     #[derive(Default)]
@@ -1460,6 +1746,7 @@ mod tests {
         OsWatcher {
             kind,
             recursive: kind.is_recursive(),
+            poll_interval_ms: Arc::new(AtomicU64::new(*DEFAULT_POLL_INTERVAL_MILLISECONDS)),
             state: Arc::new(Mutex::new(WatcherState {
                 watchers: Default::default(),
                 paths: Default::default(),
@@ -1542,7 +1829,7 @@ mod tests {
         // the deterministic executor cannot drive; park until the poll task
         // signals the event channel.
         cx.executor().allow_parking();
-        cx.executor().advance_clock(poll_interval());
+        cx.executor().advance_clock(default_poll_interval());
         rx.recv().await.expect("receive watcher event");
 
         assert!(

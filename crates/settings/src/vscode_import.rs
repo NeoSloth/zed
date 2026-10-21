@@ -201,6 +201,8 @@ impl VsCodeSettings {
             extension: ExtensionSettingsContent::default(),
             call_hierarchy: None,
             file_finder: None,
+            file_watcher_poll_ms: None,
+            file_watcher_use_polling: None,
             git: self.git_settings_content(),
             git_panel: self.git_panel_settings_content(),
             global_lsp_settings: skip_default(GlobalLspSettingsContent {

@@ -6389,6 +6389,192 @@ async fn test_single_file_worktree_deleted(cx: &mut TestAppContext) {
     );
 }
 
+/// SMB の共有ごと消えた時に、single-file worktree は閉じずに復旧を待つことを確認する。
+/// 閉じてしまうと、開いていたバッファの本文ごと失われる（スリープで共有が切れる状況）。
+#[gpui::test]
+async fn test_single_file_worktree_waits_for_network_volume_to_return(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
+    fs.insert_tree(
+        path!("/Volumes/Home"),
+        json!({
+            "notes.txt": "before sleep",
+        }),
+    )
+    .await;
+
+    let tree = Worktree::local(
+        PathBuf::from(path!("/Volumes/Home/notes.txt")),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    cx.read(|cx| assert!(!tree.read(cx).root_unavailable(), "開いた直後は到達できる"));
+
+    let deleted_event = Rc::new(Cell::new(false));
+    let unavailable_events = Rc::new(Cell::new(0));
+    let available_events = Rc::new(Cell::new(0));
+    let _subscription = cx.update({
+        let deleted_event = deleted_event.clone();
+        let unavailable_events = unavailable_events.clone();
+        let available_events = available_events.clone();
+        |cx| {
+            cx.subscribe(&tree, move |_, event, _| match event {
+                Event::Deleted => deleted_event.set(true),
+                Event::RootUnavailable => {
+                    unavailable_events.set(unavailable_events.get() + 1);
+                }
+                Event::RootAvailable => {
+                    available_events.set(available_events.get() + 1);
+                }
+                _ => {}
+            })
+        }
+    });
+
+    // 共有ごと消える。イベントが出る前に削除し終えて、親に到達できない状態にする。
+    fs.pause_events();
+    fs.remove_file(Path::new(path!("/Volumes/Home/notes.txt")), Default::default())
+        .await
+        .unwrap();
+    fs.remove_dir(Path::new(path!("/Volumes/Home")), Default::default())
+        .await
+        .unwrap();
+    fs.unpause_events_and_flush();
+    cx.background_executor.run_until_parked();
+
+    assert!(
+        !deleted_event.get(),
+        "volume ごと到達できない時に Deleted が出ると worktree が閉じられる"
+    );
+    assert_eq!(
+        unavailable_events.get(),
+        1,
+        "RootUnavailable が出ていなければ復旧を待つ task が始まらない"
+    );
+    cx.read(|cx| assert!(tree.read(cx).root_unavailable()));
+
+    // 共有が戻った。復旧を確認する間隔（2 秒）を超える分を進める。
+    fs.insert_tree(
+        path!("/Volumes/Home"),
+        json!({
+            "notes.txt": "after the share was mounted again",
+        }),
+    )
+    .await;
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.background_executor.run_until_parked();
+
+    assert_eq!(
+        available_events.get(),
+        1,
+        "root が現れたことを worktree が伝えなければならない"
+    );
+    cx.read(|cx| assert!(!tree.read(cx).root_unavailable()));
+    tree.read_with(cx, |tree, _| {
+        let root_entry = tree
+            .root_entry()
+            .expect("root の entry が作り直されているはず");
+        assert!(
+            root_entry.mtime.is_some(),
+            "ディスク上のファイルとして読み直されているはず"
+        );
+    });
+}
+
+/// 起動時に SMB が繋がっていないフォルダを開いた場合でも、共有が戻ったらその中まで読み直す。
+#[gpui::test]
+async fn test_worktree_opened_while_its_network_volume_is_unmounted(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
+
+    let tree = Worktree::local(
+        PathBuf::from(path!("/Volumes/Home/project")),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.background_executor.run_until_parked();
+    cx.read(|cx| assert!(tree.read(cx).root_unavailable()));
+
+    fs.insert_tree(
+        path!("/Volumes/Home/project"),
+        json!({
+            "src": { "main.rs": "fn main() {}" },
+        }),
+    )
+    .await;
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.background_executor.run_until_parked();
+
+    cx.read(|cx| assert!(!tree.read(cx).root_unavailable()));
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("src/main.rs")).is_some(),
+            "共有が戻った時は root の配下まで読み直す"
+        );
+    });
+}
+
+/// 起動時に SMB がまだ繋がっていない場合でも、worktree は作れて、復旧を待つ状態から
+/// 始められることを確認する。
+#[gpui::test]
+async fn test_single_file_worktree_opened_while_its_volume_is_unmounted(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.set_network_volume_prefixes([path!("/Volumes/Home")]);
+
+    let tree = Worktree::local(
+        PathBuf::from(path!("/Volumes/Home/notes.txt")),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.background_executor.run_until_parked();
+
+    cx.read(|cx| assert!(tree.read(cx).root_unavailable()));
+
+    fs.insert_tree(
+        path!("/Volumes/Home"),
+        json!({
+            "notes.txt": "mounted by the time we looked again",
+        }),
+    )
+    .await;
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(3));
+    cx.background_executor.run_until_parked();
+
+    cx.read(|cx| assert!(!tree.read(cx).root_unavailable()));
+    tree.read_with(cx, |tree, _| {
+        let root_entry = tree
+            .root_entry()
+            .expect("共有が戻った後に root の entry が作られているはず");
+        assert!(root_entry.mtime.is_some());
+    });
+}
+
 #[gpui::test]
 async fn test_root_ancestor_rename_is_detected_without_fs_events(cx: &mut TestAppContext) {
     init_test(cx);
