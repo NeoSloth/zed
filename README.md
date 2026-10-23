@@ -1,9 +1,29 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
+[Čeština](README.cs-CZ.md) · [Deutsch](README.de-DE.md) · English · [Español](README.es-ES.md) · [Français](README.fr-FR.md) · [Italiano](README.it-IT.md) · [日本語](README.ja-JP.md) · [한국어](README.ko-KR.md) · [Polski](README.pl-PL.md) · [Português](README.pt-BR.md) · [Русский](README.ru-RU.md) · [Türkçe](README.tr-TR.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+
+---
+
+## About This Fork
+
+This README is fully translated into the languages linked at the top of the page; the English text here is the canonical version.
+
+This is a public fork of [zed-industries/zed](https://github.com/zed-industries/zed). Feature changes required by the localized Zed build ([NeoSloth/zed-i18n](https://github.com/NeoSloth/zed-i18n)) are carried on the `l10n` branch.
+
+- **Changes carried** (details and the tracking procedure are in [FORK-NOTES.md](FORK-NOTES.md), written in Japanese)
+  - File watcher polling settings — adds `file_watcher_use_polling` / `file_watcher_poll_ms`; polling is chosen automatically only for network shares, FUSE, and 9P/WSL drvfs
+  - Session restore fallback — when the restore target is missing, falls back to the last opened workspace, addressing tabs not restoring when multiple instances race for one session id
+  - Tabs survive share disconnects — when SMB or another volume is briefly unreachable, the worktree stays open with the text intact, shown struck through with a red ✕ until the share returns
+- **Snapshot tags** — an upstream stable tag plus the fork's changes as a single commit are cut as `v<version>-l10n.<N>`; zed-i18n's `config/project.toml` (`zed_ref` / `zed_commit`) always pins the newest snapshot
+- **Builds** — upstream CI assumes the zed-industries organization, so every release job in this repository is skipped on forks (by design). Localized builds and their GitHub distribution run in NeoSloth/zed-i18n; the output installs as an unsigned app under the same name as official Zed
 
 ---
 
@@ -25,7 +45,7 @@ Other platforms are not yet available:
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+Zed Industries is hiring — check their [jobs](https://zed.dev/jobs) page for open roles.
 
 ### Licensing
 
