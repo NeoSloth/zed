@@ -18,7 +18,7 @@ Esto es un fork público de [zed-industries/zed](https://github.com/zed-industri
   - Respaldo en la restauración de sesiones — cuando falta el destino de restauración, recurre al último espacio de trabajo abierto; aborda el problema de que las pestañas no se restauran cuando varias instancias compiten por una misma id de sesión
   - Las pestañas sobreviven a las desconexiones del recurso compartido — cuando SMB u otro volumen queda temporalmente inalcanzable, el worktree permanece abierto con el texto intacto, mostrado tachado con una ✕ roja hasta que el recurso vuelve
 - **Etiquetas de snapshot** — una etiqueta estable de upstream más los cambios del fork como un solo commit se corta como `v<versión>-l10n.<N>`; el `config/project.toml` de zed-i18n (`zed_ref` / `zed_commit`) siempre fija el snapshot más reciente
-- **Compilaciones** — la CI de upstream asume la organización zed-industries, por lo que todos los trabajos de release de este repositorio se omiten en los forks (por diseño). Las compilaciones localizadas y su distribución en GitHub se realizan en NeoSloth/zed-i18n; el resultado se instala como una aplicación sin firmar con el mismo nombre que Zed oficial
+- **Compilaciones** — la CI de upstream asume la organización zed-industries, por lo que todos los trabajos de release de este repositorio se omiten en los forks (por diseño). Las compilaciones localizadas y su distribución en GitHub se realizan en NeoSloth/zed-i18n; el resultado se instala como una aplicación sin firmar con su propia marca «Zed i18n», separada de la Zed oficial
 
 ---
 

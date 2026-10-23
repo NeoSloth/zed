@@ -18,7 +18,7 @@ Toto je veřejný fork [zed-industries/zed](https://github.com/zed-industries/ze
   - Fallback obnovování relace — když cíl obnovy chybí, vrátí se k naposledy otevřenému workspace; řeší případ, kdy souběžné instance soutěží o jedinou session id a taby se neobnoví
   - Taby přečkají odpojení sdíleného svazku — když je SMB nebo jiný svazek dočasně nedostupný, worktree zůstává otevřená a text zachován; zobrazuje se přeškrtnutí s červeným ✕, dokud sdílení není zpět
 - **Snapshot tagy** — stabilní tag upstreamu plus změny forku jako jeden commit jsou označeny tagem `v<version>-l10n.<N>`; `config/project.toml` v zed-i18n (`zed_ref` / `zed_commit`) vždy fixuje nejnovější snapshot
-- **Sestavení** — upstream CI předpokládá organizaci zed-industries, proto jsou všechny release joby v tomto repozitáři na forku přeskočeny (záměr). Lokalizuovaná sestavení a jejich distribuce na GitHub probíhají v NeoSloth/zed-i18n; výsledek se instaluje jako nepodepsaná aplikace pod stejným názvem jako oficiální Zed
+- **Sestavení** — upstream CI předpokládá organizaci zed-industries, proto jsou všechny release joby v tomto repozitáři na forku přeskočeny (záměr). Lokalizuovaná sestavení a jejich distribuce na GitHub probíhají v NeoSloth/zed-i18n; výsledek se instaluje jako nepodepsaná aplikace s vlastní značkou Zed i18n, odděleně od oficiálního Zedu
 
 ---
 

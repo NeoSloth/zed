@@ -18,7 +18,7 @@ Questo è un fork pubblico di [zed-industries/zed](https://github.com/zed-indust
   - Fallback per il ripristino della sessione — quando la destinazione da ripristinare non c'è, ripiega sull'ultimo workspace aperto; affronta il problema delle schede non ripristinate quando più istanze si contendono un'unica id di sessione
   - Le schede sopravvivono alla disconnessione della condivisione — quando SMB o un altro volume è temporaneamente irraggiungibile, il worktree resta aperto con il testo integro, mostrato barrato con una ✕ rossa finché la condivisione non torna
 - **Tag di snapshot** — un tag stabile di upstream più le modifiche del fork come un singolo commit vengono etichettati come `v<versione>-l10n.<N>`; il `config/project.toml` di zed-i18n (`zed_ref` / `zed_commit`) fissa sempre lo snapshot più recente
-- **Build** — la CI di upstream presuppone l'organizzazione zed-industries, quindi tutti i job di release di questo repository vengono saltati nei fork (per progettazione). Le build localizzate e la loro distribuzione su GitHub avvengono in NeoSloth/zed-i18n; il risultato si installa come app non firmata con lo stesso nome di Zed ufficiale
+- **Build** — la CI di upstream presuppone l'organizzazione zed-industries, quindi tutti i job di release di questo repository vengono saltati nei fork (per progettazione). Le build localizzate e la loro distribuzione su GitHub avvengono in NeoSloth/zed-i18n; il risultato si installa come app non firmata con il proprio brand «Zed i18n», separato da Zed ufficiale
 
 ---
 

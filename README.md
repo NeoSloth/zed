@@ -23,7 +23,7 @@ This is a public fork of [zed-industries/zed](https://github.com/zed-industries/
   - Session restore fallback — when the restore target is missing, falls back to the last opened workspace, addressing tabs not restoring when multiple instances race for one session id
   - Tabs survive share disconnects — when SMB or another volume is briefly unreachable, the worktree stays open with the text intact, shown struck through with a red ✕ until the share returns
 - **Snapshot tags** — an upstream stable tag plus the fork's changes as a single commit are cut as `v<version>-l10n.<N>`; zed-i18n's `config/project.toml` (`zed_ref` / `zed_commit`) always pins the newest snapshot
-- **Builds** — upstream CI assumes the zed-industries organization, so every release job in this repository is skipped on forks (by design). Localized builds and their GitHub distribution run in NeoSloth/zed-i18n; the output installs as an unsigned app under the same name as official Zed
+- **Builds** — upstream CI assumes the zed-industries organization, so every release job in this repository is skipped on forks (by design). Localized builds and their GitHub distribution run in NeoSloth/zed-i18n; the output installs as an unsigned app under its own 'Zed i18n' branding, separate from official Zed
 
 ---
 

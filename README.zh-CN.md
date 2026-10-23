@@ -18,7 +18,7 @@
   - 会话恢复回退 —— 找不到恢复目标时回退到最近打开的工作区，处理多个实例争用同一会话 ID 导致标签页无法恢复的问题
   - 共享断开时保留标签页 —— SMB 等卷暂时不可达时不会关闭 worktree 并保留正文内容，在共享恢复前显示删除线和红色 ✕
 - **快照标签** —— 将上游稳定标签加上本 fork 的改动（单个 commit）标记为 `v<版本>-l10n.<N>`；zed-i18n 的 `config/project.toml`（`zed_ref` / `zed_commit`）始终固定指向最新的快照
-- **构建** —— 上游 CI 以 zed-industries 组织为前提，因此本仓库的所有 release job 在 fork 上都会被跳过（属正常设计）。本地化构建及其在 GitHub 上的发行在 NeoSloth/zed-i18n 一侧进行；产物未经代码签名，以与官方 Zed 相同的名称安装
+- **构建** —— 上游 CI 以 zed-industries 组织为前提，因此本仓库的所有 release job 在 fork 上都会被跳过（属正常设计）。本地化构建及其在 GitHub 上的发行在 NeoSloth/zed-i18n 一侧进行；产物未经代码签名，以独立的 "Zed i18n" 品牌安装（与官方 Zed 相区分）
 
 ---
 

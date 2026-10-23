@@ -18,7 +18,7 @@ Dies ist ein öffentlicher Fork von [zed-industries/zed](https://github.com/zed-
   - Fallback bei der Sitzungswiederherstellung — wenn das Wiederherstellungsziel fehlt, wird auf den zuletzt geöffneten Workspace ausgewichen; adressiert das Problem, dass Tabs nicht wiederhergestellt werden, wenn mehrere Instanzen um eine Session-ID konkurrieren
   - Tabs überstehen Trennungen der Freigabe — wenn SMB oder ein anderes Volume vorübergehend nicht erreichbar ist, bleibt die Worktree offen und der Text erhalten, dargestellt mit Durchstreichung und rotem ✕, bis die Freigabe wieder erreichbar ist
 - **Snapshot-Tags** — ein stabiler Upstream-Tag plus die Fork-Änderungen als ein einzelner Commit werden als `v<version>-l10n.<N>` markiert; die `config/project.toml` von zed-i18n (`zed_ref` / `zed_commit`) pinnt stets den neuesten Snapshot
-- **Builds** — die Upstream-CI setzt die Organisation zed-industries voraus, daher werden alle Release-Jobs in diesem Repository auf Forks übersprungen (by design). Lokalisierte Builds und deren GitHub-Distribution laufen in NeoSloth/zed-i18n; das Ergebnis installiert sich als unsignierte App unter demselben Namen wie das offizielle Zed
+- **Builds** — die Upstream-CI setzt die Organisation zed-industries voraus, daher werden alle Release-Jobs in diesem Repository auf Forks übersprungen (by design). Lokalisierte Builds und deren GitHub-Distribution laufen in NeoSloth/zed-i18n; das Ergebnis installiert sich als unsignierte App mit eigener Marke „Zed i18n“, getrennt vom offiziellen Zed
 
 ---
 

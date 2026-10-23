@@ -18,7 +18,7 @@ Bu, [zed-industries/zed](https://github.com/zed-industries/zed) deposunun herkes
   - Oturum geri yükleme yedek yolu — geri yüklenecek hedef bulunamadığında son açılan workspace'e geri dönülür; birden çok örneğin tek bir oturum kimliği için yarışması nedeniyle sekmelerin geri yüklenememesi sorununu ele alır
   - Paylaşım bağlantısı koptuğunda sekmeler korunur — SMB veya başka bir birim geçici olarak ulaşılamaz olduğunda worktree kapanmaz ve metin yerinde kalır; paylaşım geri gelene kadar üstü çizili ve kırmızı bir ✕ ile gösterilir
 - **Anlık görüntü (snapshot) etiketleri** — kararlı bir upstream etiketi ile fork'un değişiklikleri tek commit olarak `v<sürüm>-l10n.<N>` biçiminde etiketlenir; zed-i18n'in `config/project.toml` dosyası (`zed_ref` / `zed_commit`) her zaman en yeni anlık görüntüyü sabitler
-- **Derlemeler** — upstream CI, zed-industries organizasyonunu varsayar; bu nedenle bu depodaki tüm sürüm işleri forklarda atlanır (tasarım gereği). Yerelleştirilmiş derlemeler ve bunların GitHub üzerinden dağıtımı NeoSloth/zed-i18n tarafında yürür; çıktı, resmi Zed ile aynı ada sahip imzasız bir uygulama olarak kurulur
+- **Derlemeler** — upstream CI, zed-industries organizasyonunu varsayar; bu nedenle bu depodaki tüm sürüm işleri forklarda atlanır (tasarım gereği). Yerelleştirilmiş derlemeler ve bunların GitHub üzerinden dağıtımı NeoSloth/zed-i18n tarafında yürür; çıktı, resmi Zed'den ayrı, kendi "Zed i18n" markasına sahip imzasız bir uygulama olarak kurulur
 
 ---
 

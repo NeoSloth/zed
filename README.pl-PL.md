@@ -18,7 +18,7 @@ To jest publiczny fork [zed-industries/zed](https://github.com/zed-industries/ze
   - Zastępowanie przy przywracaniu sesji — gdy cel przywrócenia nie istnieje, następuje zastąpienie ostatnio otwartym workspace; rozwiązuje problem nieprzywracanych kart, gdy wiele instancji rywalizuje o jedną id sesji
   - Karty przetrwają rozłączenie udziału — gdy SMB lub inny wolumin jest chwilowo niedostępny, worktree pozostaje otwarty z zachowaną treścią, wyświetlany przekreślony z czerwonym ✕ aż do powrotu udziału
 - **Tagi snapshotów** — stabilny tag upstreamu plus zmiany forku jako jeden commit są oznaczane tagiem `v<wersja>-l10n.<N>`; `config/project.toml` zed-i18n (`zed_ref` / `zed_commit`) zawsze przypina najnowszy snapshot
-- **Buildy** — CI upstreamu zakłada organizację zed-industries, dlatego wszystkie joby release w tym repozytorium są pomijane na forkach (z założenia). Lokalizowane buildy i ich dystrybucja na GitHubie odbywają się w NeoSloth/zed-i18n; wynik instaluje się jako niesygnowana aplikacja pod tą samą nazwą co oficjalny Zed
+- **Buildy** — CI upstreamu zakłada organizację zed-industries, dlatego wszystkie joby release w tym repozytorium są pomijane na forkach (z założenia). Lokalizowane buildy i ich dystrybucja na GitHubie odbywają się w NeoSloth/zed-i18n; wynik instaluje się jako niesygnowana aplikacja pod własną marką „Zed i18n“, oddzielnie od oficjalnego Zeda
 
 ---
 

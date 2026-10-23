@@ -18,7 +18,7 @@ Este é um fork público do [zed-industries/zed](https://github.com/zed-industri
   - Alternativa na restauração de sessão — quando o alvo de restauração não existe, recorre ao último workspace aberto; resolve o problema de abas que não são restauradas quando várias instâncias disputam um mesmo id de sessão
   - Abas sobrevivem à desconexão do compartilhamento — quando SMB ou outro volume fica temporariamente inacessível, o worktree permanece aberto com o texto intacto, exibido riscado com um ✕ vermelho até o compartilhamento voltar
 - **Tags de snapshot** — uma tag estável do upstream mais as alterações do fork como um único commit são cortadas como `v<versão>-l10n.<N>`; o `config/project.toml` do zed-i18n (`zed_ref` / `zed_commit`) fixa sempre o snapshot mais recente
-- **Compilações** — a CI do upstream assume a organização zed-industries, portanto todos os jobs de release deste repositório são pulados em forks (por design). As compilações localizadas e sua distribuição no GitHub ocorrem no NeoSloth/zed-i18n; o resultado é instalado como um app sem assinatura com o mesmo nome do Zed oficial
+- **Compilações** — a CI do upstream assume a organização zed-industries, portanto todos os jobs de release deste repositório são pulados em forks (por design). As compilações localizadas e sua distribuição no GitHub ocorrem no NeoSloth/zed-i18n; o resultado é instalado como um app sem assinatura com a própria marca "Zed i18n", separada do Zed oficial
 
 ---
 

@@ -18,7 +18,7 @@ Ceci est un fork public de [zed-industries/zed](https://github.com/zed-industrie
   - Repli pour la restauration de session — quand la cible de restauration est absente, on se rabat sur le dernier espace de travail ouvert ; répond au problème des onglets non restaurés quand plusieurs instances se disputent une même identifiant de session
   - Les onglets survivent à la coupure du partage — quand SMB ou un autre volume est temporairement injoignable, le worktree reste ouvert et le texte intact, affiché barré avec un ✕ rouge jusqu'au retour du partage
 - **Tags instantanés (snapshot)** — un tag stable d'upstream plus les modifications du fork en un seul commit sont découpés en `v<version>-l10n.<N>` ; le `config/project.toml` de zed-i18n (`zed_ref` / `zed_commit`) épingle toujours l'instantané le plus récent
-- **Compilations** — la CI d'upstream suppose l'organisation zed-industries, aussi tous les jobs de publication de ce dépôt sont sautés sur les forks (conçu ainsi). Les compilations localisées et leur distribution GitHub ont lieu dans NeoSloth/zed-i18n ; le résultat s'installe comme une application non signée sous le même nom que Zed officiel
+- **Compilations** — la CI d'upstream suppose l'organisation zed-industries, aussi tous les jobs de publication de ce dépôt sont sautés sur les forks (conçu ainsi). Les compilations localisées et leur distribution GitHub ont lieu dans NeoSloth/zed-i18n ; le résultat s'installe comme une application non signée sous sa propre marque « Zed i18n », distincte de Zed officiel
 
 ---
 

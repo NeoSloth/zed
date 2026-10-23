@@ -18,7 +18,7 @@
   - 工作階段復原退避 —— 找不到復原目標時退避到最近開啟的工作區，處理多個執行個體爭用同一工作階段 ID 導致標籤頁無法復原的問題
   - 共用中斷時保留標籤頁 —— SMB 等磁碟區暫時不可達時不會關閉 worktree 並保留正文內容，在共用恢復前顯示刪除線和紅色 ✕
 - **快照標籤** —— 將上游穩定標籤加上本 fork 的改動（單一 commit）標記為 `v<版本>-l10n.<N>`；zed-i18n 的 `config/project.toml`（`zed_ref` / `zed_commit`）始終固定指向最新的快照
-- **組建** —— 上游 CI 以 zed-industries 組織為前提，因此本倉庫的所有 release job 在 fork 上都會被跳過（屬正常設計）。本地化組建及其在 GitHub 上的發行在 NeoSloth/zed-i18n 一側進行；產物未經程式碼簽名，以與官方 Zed 相同的名稱安裝
+- **組建** —— 上游 CI 以 zed-industries 組織為前提，因此本倉庫的所有 release job 在 fork 上都會被跳過（屬正常設計）。本地化組建及其在 GitHub 上的發行在 NeoSloth/zed-i18n 一側進行；產物未經程式碼簽名，以獨立的 "Zed i18n" 品牌安裝（與官方 Zed 區分）
 
 ---
 
